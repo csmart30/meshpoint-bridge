@@ -1,0 +1,38 @@
+# Python bytecode and environments
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+
+# Test/build/tool output
+.pytest_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+*.env
+credentials.env
+secrets/
+
+# Runtime state and logs (never commit device-specific state)
+favorites.json
+state/
+var/
+logs/
+*.log
+
+# Editor/OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
