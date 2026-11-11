@@ -6,7 +6,7 @@ A small Python bridge that makes a [Meshpoint](https://github.com/KMX415/meshpoi
 
 ## Hardware compatibility and testing
 
-**The bridge is designed to work with Meshpoint, not with a particular radio board or gateway enclosure.** It communicates with Meshpoint through its HTTP REST API and WebSocket; it does not directly access the LoRa concentrator, SPI, GPIO, or other hardware-specific interfaces. The bridge can run on the Meshpoint host or on a separate Python-capable machine that can reach the Meshpoint API and accept TCP connections from the Meshtastic app. Set `--meshpoint HOST:PORT` to point it at the Meshpoint instance.
+**The bridge is designed to work with Meshpoint, not with a particular radio board or gateway enclosure.** It communicates with Meshpoint through its HTTP REST API and WebSocket; it does not directly access the LoRa concentrator, SPI, GPIO, or other hardware-specific interfaces. The bridge is intended to be installed on the Linux device that runs Meshpoint, where it talks to the local Meshpoint API (`127.0.0.1:8080` by default). Use `--meshpoint HOST:PORT` if your Meshpoint API listens on a different port.
 
 In principle, this means it should work with any platform that runs a compatible Meshpoint release and exposes the API endpoints/events the bridge uses. Compatibility with different Meshpoint versions and deployments still needs testing. The bridge itself is hardware-agnostic; **Meshpoint's own hardware support requirements still apply**. Consult the [Meshpoint hardware matrix](https://github.com/KMX415/meshpoint/blob/main/docs/HARDWARE-MATRIX.md) and [onboarding guide](https://github.com/KMX415/meshpoint/blob/main/docs/ONBOARDING.md) for current platform support and experimental paths.
 
@@ -48,7 +48,7 @@ The bridge presents a virtual Meshtastic node to the phone. Meshpoint remains re
 
 - Meshtastic TCP framing on port `4403`.
 - mDNS service advertisement (`_meshtastic._tcp.local.`) when `zeroconf` is installed.
-- Meshpoint dashboard authentication using an interactive password prompt or environment variables.
+- Meshpoint dashboard authentication using an interactive password prompt or environment variables. The credentials are kept in memory so the bridge can log in again if the dashboard session expires *(not yet live-verified)*.
 - Initial configuration and node database exchange with the Meshtastic app.
 - Text-message TX through Meshpoint's REST API.
 - Text-message RX through Meshpoint's WebSocket.
@@ -57,6 +57,12 @@ The bridge presents a virtual Meshtastic node to the phone. Meshpoint remains re
 - Device-metric forwarding for battery percentage, voltage, channel utilization, and transmit airtime utilization when Meshpoint supplies those values. Hop count and battery percentage have been observed in the native app; the other metrics still need individual live verification.
 - Environmental temperature and relative-humidity forwarding through Meshtastic `TELEMETRY_APP`; both have been verified in the native app and matched Meshpoint readings.
 - Read-only responses to selected admin queries.
+- A stable virtual node ID derived from the device's MAC address (see [Node identity](#node-identity)) *(not yet live-verified)*.
+- Nodes whose reported position is exactly 0,0 are treated as having no GPS position and are shown without a map pin *(not yet live-verified)*.
+- Replies and tapbacks received from the mesh are forwarded to the app with their reply ID and tapback flag. The Meshpoint field names for these are a best guess and still need checking with `--probe` *(not yet live-verified)*.
+- Robustness: a bad WebSocket event is logged instead of dropping the connection, a phone that stops reading is disconnected without stalling other traffic, Meshpoint REST calls time out after 30 seconds, and SIGINT/SIGTERM shut the bridge down cleanly (including mDNS goodbyes) *(not yet live-verified)*.
+
+Items marked *not yet live-verified* were added in a hardening update. They are covered by unit tests of the helper functions where practical, but have not yet been exercised on the RAK Miner V2 installation. See [docs/TESTING.md](docs/TESTING.md) for the pending checklist.
 
 ## Current limitations / planned work
 
@@ -66,6 +72,7 @@ The following are **not implemented yet**:
 - Persisting favorite/unfavorite actions from the native Meshtastic app to a bridge-local favorites file. The current bridge acknowledges `set_favorite_node` but does not persist it.
 - A systemd service, boot-time enablement, installer, or protected credential-file setup.
 - Increase support for more Meshtastic packet types and administration operations (traceroute, node info exchanges).
+- Sending replies and tapbacks from the phone. They are currently transmitted as plain text messages, because it is not known whether Meshpoint's send API accepts reply/tapback fields.
 
 The planned favorite list will be managed by the bridge and will be independent of Meshpoint dashboard favorites. The intended retention rule is: include nodes heard in the previous five days **or** nodes favorited locally through the Meshtastic app.
 
@@ -73,7 +80,7 @@ See [docs/ROADMAP.md](docs/ROADMAP.md) for the development plan and [docs/TESTIN
 
 ## Requirements
 
-- A machine capable of running Python 3 and a working Python virtual environment. This may be the Meshpoint host or a separate machine.
+- The Linux device that runs Meshpoint, with Python 3 and a working Python virtual environment. Linux is required: the bridge reads network-interface information from `/sys/class/net` to derive its node ID.
 - A running, compatible Meshpoint installation with its HTTP API and WebSocket reachable from the bridge.
 - Network access from the phone to the bridge host on TCP port `4403`.
 - Python packages listed in `requirements.txt`.
@@ -97,11 +104,13 @@ source venv/bin/activate
 pip install --upgrade pip
 pip install -r requirements.txt
 
-# Run against Meshpoint on this same host; use its LAN hostname/IP if it is elsewhere
+# Run against the Meshpoint API on this same device
 python3 meshpoint_bridge.py --meshpoint 127.0.0.1:8080 -v
 ```
 
 The first run may prompt for the Meshpoint dashboard password. The script also accepts `MESHPOINT_USERNAME` and `MESHPOINT_PASSWORD` environment variables. Do not put real credentials in this repository or in a file that Git tracks.
+
+If the dashboard session expires while the bridge is running, it logs in again with the same credentials. If that login is rejected, it waits 5 minutes before trying again, to avoid triggering Meshpoint's login lockout.
 
 To inspect the Meshpoint API shape and WebSocket events, use:
 
@@ -118,13 +127,25 @@ The probe can print node and packet details. Review its output before sharing it
 3. Select the bridge's mDNS-advertised node if it appears, or enter the bridge host's IP address and TCP port `4403`.
 4. Keep the phone and bridge on networks that allow the connection. mDNS discovery generally does not cross routed VLANs without an mDNS reflector; manual IP entry may be needed.
 
+## Node identity
+
+The virtual node ID shown in the Meshtastic app is chosen in this order:
+
+1. `--node-id`, if given.
+2. The node ID in the Meshpoint configuration, if it has one.
+3. The last four bytes of the device's wired Ethernet MAC address.
+4. The last four bytes of the device's Wi-Fi MAC address, if there is no Ethernet interface.
+5. A random ID, only if none of the above is available. A warning is logged, and the ID changes on every restart.
+
+Virtual interfaces (loopback, Docker, bridges, VPNs) are ignored. If you upgraded from a version that used a random ID, the node ID your phone sees will change once.
+
 ## Command-line options
 
 ```text
 --meshpoint HOST:PORT   Meshpoint API address (default: 127.0.0.1:8080)
 --listen-port PORT      Meshtastic TCP port (default: 4403)
 --advertise-ip ADDRESS  Advertise one specific IPv4 address via mDNS
---node-id NODE_ID       Override the virtual node ID
+--node-id NODE_ID       Override the virtual node ID (default: Meshpoint config, then Ethernet MAC, then Wi-Fi MAC)
 --username USERNAME     Meshpoint dashboard username
 --password PASSWORD     Meshpoint dashboard password
 --probe                 Inspect Meshpoint config, API schema, and WebSocket events
@@ -138,11 +159,20 @@ The username and password can also be supplied using `MESHPOINT_USERNAME` and `M
 - The TCP listener binds to `0.0.0.0` by default and currently has no client authentication. Restrict TCP port `4403` to trusted LAN clients with your firewall/network configuration; do not expose it directly to the internet.
 - Keep Meshpoint's dashboard/API on a trusted network. The default API URL is loopback (`127.0.0.1:8080`) when the bridge runs on the Meshpoint host.
 - Never commit passwords, tokens, cookies, `.env` files, runtime state, or device-specific logs. The repository `.gitignore` excludes common secret and runtime paths, but always inspect `git status` before committing.
+- The dashboard credentials stay in the bridge process's memory while it runs, so it can log in again after a session expires.
 - Normal logging currently includes message text. Be mindful when sharing logs, especially when using DMs.
 
 ## Development status
 
 The first public repository snapshot is intended to preserve the working baseline before the next feature changes. The RAK Miner V2 installation is the current reference test environment, not a platform restriction. Functional changes should be made in separate commits and validated against the known-good TX/RX and DM behavior.
+
+## Running the tests
+
+The unit tests use only the standard library plus the packages in `requirements.txt`:
+
+```bash
+python3 -m unittest discover -s tests -v
+```
 
 ## License
 
