@@ -146,4 +146,4 @@ The first public repository snapshot is intended to preserve the working baselin
 
 ## License
 
-No license has been selected for this repository yet. Plans to add the license type are in progress. A public GitHub repository without a license is viewable, but that does not grant general reuse rights.
+This project is licensed under the GNU Affero General Public License v3.0 only (AGPL-3.0-only). See [LICENSE](LICENSE) for the full license text.

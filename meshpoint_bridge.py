@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only
 """
 meshpoint_bridge - makes a Meshpoint look like a Meshtastic node (TCP API, port 4403)
 so the Meshtastic phone app can connect to it over Wi-Fi.
