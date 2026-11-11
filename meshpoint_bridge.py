@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: AGPL-3.0-only
 """
 meshpoint_bridge - makes a Meshpoint look like a Meshtastic node (TCP API, port 4403)
 so the Meshtastic phone app can connect to it over Wi-Fi.
 
   Phone app <--TCP 4403 (framed protobuf)--> bridge <--REST + WebSocket :8080--> Meshpoint
+
+Install this on the (Linux) device that runs the Meshpoint.
 
 STATUS: Experimental / pre-release. This bridge has been tested against a live
 Meshpoint installation on a RAK Miner V2. The native Meshtastic app has
@@ -29,10 +30,12 @@ import math
 import os
 import random
 import re
+import signal
 import socket
 import sys
 import time
-from datetime import datetime
+from collections import deque
+from datetime import datetime, timezone
 
 import aiohttp
 from google.protobuf.message import DecodeError
@@ -47,10 +50,12 @@ NONCE_ONLY_NODES = 69421   # app asks for the node list only
 CONFIG_KINDS = {0: "device", 1: "position", 2: "power", 3: "network",
                 4: "display", 5: "lora", 6: "bluetooth", 7: "security"}
 MAX_CHANNELS = 8
+REST_TIMEOUT = aiohttp.ClientTimeout(total=30)  # per REST call; the websocket has no such limit
+RELOGIN_BACKOFF = 300  # seconds to wait after a failed re-login (avoids tripping the dashboard lockout)
 log = logging.getLogger("bridge")
 
 REGION_MAP = {"US915": "US", "EU868": "EU_868", "ANZ915": "ANZ", "IN865": "IN",
-              "KR920": "KR", "SG923": "SG_923", "EU_868": "EU_868", "SG_923": "SG_923"}
+              "KR920": "KR", "SG923": "SG_923"}
 
 
 # ----------------------------------------------------------------- helpers
@@ -86,15 +91,46 @@ def node_id(num):
     return "!%08x" % num
 
 
+def mac_node_num(base="/sys/class/net"):
+    """Node number from this machine's MAC address (last 4 bytes, like real Meshtastic nodes).
+    Prefers a wired Ethernet interface, then Wi-Fi. Returns None if neither has a usable MAC.
+    `base` is the sysfs network directory (a parameter so tests can point it elsewhere)."""
+    try:
+        names = sorted(os.listdir(base))
+    except OSError:
+        return None
+    wired, wifi = [], []
+    for name in names:
+        path = os.path.join(base, name)
+        if name == "lo" or "/virtual/" in os.path.realpath(path):  # skip loopback, docker, bridges, VPNs...
+            continue
+        try:
+            with open(os.path.join(path, "address")) as f:
+                mac = f.read().strip().lower()
+        except OSError:
+            continue
+        if not re.fullmatch(r"([0-9a-f]{2}:){5}[0-9a-f]{2}", mac) or mac == "00:00:00:00:00:00":
+            continue
+        (wifi if os.path.isdir(os.path.join(path, "wireless")) else wired).append(mac)
+    mac = (wired or wifi or [None])[0]
+    if mac is None:
+        return None
+    num = int(mac.replace(":", "")[-8:], 16)
+    return num if num not in (0, BROADCAST) else None
+
+
 def to_epoch(v):
     if v is None:
         return 0
     if isinstance(v, (int, float)):
         return int(v)
     try:
-        return int(datetime.fromisoformat(str(v).replace("Z", "+00:00")).timestamp())
+        dt = datetime.fromisoformat(str(v).replace("Z", "+00:00"))
     except ValueError:
         return 0
+    if dt.tzinfo is None:  # no zone given: assume UTC rather than this machine's local time
+        dt = dt.replace(tzinfo=timezone.utc)
+    return int(dt.timestamp())
 
 
 def decode_psk(v):
@@ -144,26 +180,6 @@ def trunc_utf8(text, max_bytes):
     return str(text).encode()[:max_bytes].decode("utf-8", "ignore")
 
 
-# Fields from Meshpoint that should refresh the phone's node record when they change.
-# Device metrics are exposed on NodeInfo.device_metrics; temperature and humidity
-# are sent separately as TELEMETRY_APP / EnvironmentMetrics packets.
-NODE_SIG_KEYS = (
-    "long_name", "short_name", "latitude", "longitude", "altitude",
-    "hardware_model", "public_key", "role", "last_heard",
-    "latest_snr", "latest_hops", "latest_battery",
-    "latest_voltage", "latest_channel_util", "latest_air_util",
-)
-
-ENVIRONMENT_SIG_KEYS = ("latest_temperature", "latest_humidity")
-
-def node_sig(d):
-    return json.dumps({k: d.get(k) for k in NODE_SIG_KEYS}, sort_keys=True, default=str)
-
-
-def environment_sig(d):
-    return json.dumps({k: d.get(k) for k in ENVIRONMENT_SIG_KEYS}, sort_keys=True, default=str)
-
-
 def finite_float(value):
     """Return a finite float for a Meshpoint metric, or None when absent/invalid."""
     if value is None or isinstance(value, bool):
@@ -173,6 +189,32 @@ def finite_float(value):
     except (TypeError, ValueError):
         return None
     return result if math.isfinite(result) else None
+
+
+def valid_position(lat, lon):
+    """(lat, lon) as floats, or None if missing, out of range, or exactly 0,0 (treated as 'GPS not set')."""
+    lat, lon = finite_float(lat), finite_float(lon)
+    if lat is None or lon is None or (lat == 0 and lon == 0):
+        return None
+    if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+        return None
+    return lat, lon
+
+
+# Fields from Meshpoint that should refresh the phone's node record when they change.
+# Device metrics are exposed on NodeInfo.device_metrics; temperature and humidity
+# are sent separately as TELEMETRY_APP / EnvironmentMetrics packets.
+NODE_SIG_KEYS = (
+    "long_name", "short_name", "latitude", "longitude", "altitude",
+    "hardware_model", "public_key", "role", "last_heard",
+    "latest_snr", "latest_hops", "latest_battery",
+    "latest_voltage", "latest_channel_util", "latest_air_util",
+)
+ENVIRONMENT_SIG_KEYS = ("latest_temperature", "latest_humidity")
+
+
+def signature(d, keys):
+    return tuple(d.get(k) for k in keys)
 
 
 def snake_upper(s):
@@ -235,14 +277,19 @@ def mask(obj):
     return obj
 
 
-def resolve_schema(spec, sch, depth=3):
-    if not isinstance(sch, dict) or depth < 0:
+def resolve_schema(spec, sch, depth=6):
+    """Inline $ref targets (also inside lists such as anyOf/allOf) so the probe output is readable."""
+    if depth < 0:
+        return sch
+    if isinstance(sch, list):
+        return [resolve_schema(spec, x, depth - 1) for x in sch]
+    if not isinstance(sch, dict):
         return sch
     if "$ref" in sch:
         name = sch["$ref"].split("/")[-1]
-        return {"$": name, **resolve_schema(spec, spec.get("components", {}).get("schemas", {}).get(name, {}), depth - 1)}
-    return {k: (resolve_schema(spec, v, depth - 1) if isinstance(v, (dict, list)) else v)
-            for k, v in sch.items()} if not isinstance(sch, list) else [resolve_schema(spec, x, depth - 1) for x in sch]
+        target = spec.get("components", {}).get("schemas", {}).get(name, {})
+        return {"$": name, **resolve_schema(spec, target, depth - 1)}
+    return {k: resolve_schema(spec, v, depth - 1) for k, v in sch.items()}
 
 
 # ----------------------------------------------------------------- TX body
@@ -269,7 +316,8 @@ async def try_login(session, base, username, password):
         return False
     for net_try in range(3):
         try:
-            async with session.post(base + LOGIN_PATH, json={"username": username, "password": password}) as r:
+            async with session.post(base + LOGIN_PATH, json={"username": username, "password": password},
+                                    timeout=REST_TIMEOUT) as r:
                 text = await r.text()
                 log.debug("login -> %s %s", r.status, text[:120])
                 if r.status in (401, 403):
@@ -295,7 +343,7 @@ async def try_login(session, base, username, password):
             log.debug("login network error (%s), retrying", e)
             await asyncio.sleep(0.5)
             continue
-        async with session.get(f"{base}/api/config") as t:
+        async with session.get(f"{base}/api/config", timeout=REST_TIMEOUT) as t:
             if t.status == 200:
                 log.info("logged in as %s", username)
                 return True
@@ -311,14 +359,16 @@ async def ensure_login(session, base, args):
     """Log in to the Meshpoint dashboard (v0.7.3+ requires auth).
     Interactive flow: default user (admin) + password, again on a wrong password,
     then ask for a username and password, then give up with a hint.
-    If --password / MESHPOINT_PASSWORD is given, it is tried once (no prompts)."""
-    async with session.get(f"{base}/api/config") as r:
+    If --password / MESHPOINT_PASSWORD is given, it is tried once (no prompts).
+    Returns (user, password) when a login was needed (so the bridge can log in again
+    after the session expires), or None when the Meshpoint needs no login."""
+    async with session.get(f"{base}/api/config", timeout=REST_TIMEOUT) as r:
         if r.status != 401:
-            return  # auth not required
+            return None
     user = args.username or "admin"
     if args.password:
         if await try_login(session, base, user, args.password):
-            return
+            return user, args.password
         raise SystemExit(VERIFY_MSG)
     if not sys.stdin.isatty():
         raise SystemExit("Meshpoint requires a login. Set MESHPOINT_PASSWORD (and MESHPOINT_USERNAME "
@@ -326,26 +376,66 @@ async def ensure_login(session, base, args):
     for attempt in (1, 2):
         pw = getpass.getpass(f"Enter dashboard password for user '{user}': ")
         if await try_login(session, base, user, pw):
-            return
+            return user, pw
         print("Login failed." + (" Try again." if attempt == 1 else ""))
     user = input("Enter dashboard username: ").strip() or user
     pw = getpass.getpass(f"Enter dashboard password for user '{user}': ")
     if await try_login(session, base, user, pw):
-        return
+        return user, pw
     raise SystemExit(VERIFY_MSG)
 
 
 # ----------------------------------------------------------------- client
 class Client:
+    """One connected phone. Frames go through a bounded queue drained by a writer task,
+    so a stalled phone can never block the Meshpoint -> phone event flow for everyone else."""
+    QUEUE_MAX = 512
+    WRITE_TIMEOUT = 15  # seconds a single drain() may take before the phone is considered dead
+
     def __init__(self, writer):
         self.writer = writer
         self.ready = False
         self.peer = None
+        self.queue = asyncio.Queue(self.QUEUE_MAX)
+        self.task = asyncio.create_task(self._writer())
+
+    @staticmethod
+    def frame(fr):
+        data = fr.SerializeToString()
+        return bytes([START1, START2, len(data) >> 8, len(data) & 0xFF]) + data
 
     async def send(self, fr):
-        data = fr.SerializeToString()
-        self.writer.write(bytes([START1, START2, len(data) >> 8, len(data) & 0xFF]) + data)
-        await self.writer.drain()
+        """Queue a frame, waiting for room (used for replies and the initial config dump)."""
+        data = self.frame(fr)
+        while True:
+            try:
+                self.queue.put_nowait(data)
+                return
+            except asyncio.QueueFull:
+                if self.task.done():
+                    raise ConnectionResetError("phone connection closed")
+                await asyncio.sleep(0.05)
+
+    def try_send(self, fr):
+        """Queue a frame without waiting. False means the phone is too far behind."""
+        try:
+            self.queue.put_nowait(self.frame(fr))
+            return True
+        except asyncio.QueueFull:
+            return False
+
+    async def _writer(self):
+        try:
+            while True:
+                self.writer.write(await self.queue.get())
+                await asyncio.wait_for(self.writer.drain(), self.WRITE_TIMEOUT)
+        except (OSError, asyncio.TimeoutError) as e:
+            log.info("write to phone %s failed (%s); closing", self.peer, type(e).__name__)
+            self.writer.close()
+
+    def close(self):
+        self.task.cancel()
+        self.writer.close()
 
 
 # ----------------------------------------------------------------- bridge
@@ -354,7 +444,12 @@ class Bridge:
         self.args = args
         self.base = f"http://{args.meshpoint}"
         self.session = None
+        self.creds = None          # (user, password) for logging in again after the session expires
+        self.login_lock = asyncio.Lock()
+        self.login_gen = 0         # bumped on every successful re-login
+        self.next_relogin = 0.0    # monotonic time before which we won't try again
         self.clients = set()
+        self.tasks = set()         # strong refs to fire-and-forget tasks
         self.nodes = {}
         self.node_sig = {}
         self.env_sig = {}
@@ -364,20 +459,64 @@ class Bridge:
         self.hop_limit = 3
         self.hash_to_idx = {}
         self.slots = {}
-        self.default_name = "LongFast"
-        self.seen_ids = set()
+        self.seen = deque(maxlen=2000)  # recent packet ids, oldest evicted first
+        self.seen_set = set()
         self.last_nodeinfo_tx = 0.0
         self.own_pos = None
         self.pending = {}  # Meshpoint packet id -> (phone packet id, destination node) for DMs awaiting a real ack
         self.fr_id = random.randint(1, 2**31)
 
+    # ---- Meshpoint REST (re-logs in once on a 401)
+    async def _request(self, method, path, **kw):
+        async with self.session.request(method, self.base + path, timeout=REST_TIMEOUT, **kw) as r:
+            return r.status, await r.text()
+
+    async def call(self, method, path, **kw):
+        gen = self.login_gen
+        status, text = await self._request(method, path, **kw)
+        if status == 401 and await self.relogin(gen):
+            status, text = await self._request(method, path, **kw)
+        return status, text
+
+    async def get_json(self, path):
+        status, text = await self.call("GET", path)
+        if status >= 300:
+            raise RuntimeError(f"GET {path} -> {status}")
+        return json.loads(text)
+
+    async def relogin(self, seen_gen):
+        """Log in again with the stored credentials. seen_gen is the login generation the failed
+        request was made under, so concurrent failures trigger only one login."""
+        if not self.creds:
+            return False
+        async with self.login_lock:
+            if self.login_gen != seen_gen:
+                return True  # another task already refreshed the session
+            if time.monotonic() < self.next_relogin:
+                return False
+            log.info("Meshpoint session expired; logging in again")
+            try:
+                ok = await try_login(self.session, self.base, *self.creds)
+            except SystemExit as e:  # try_login signals fatal problems this way
+                log.warning("re-login failed: %s", e)
+                ok = False
+            if ok:
+                self.login_gen += 1
+            else:
+                log.warning("re-login failed; not retrying for %ds", RELOGIN_BACKOFF)
+                self.next_relogin = time.monotonic() + RELOGIN_BACKOFF
+            return ok
+
     # ---- Meshpoint config
     async def load_config(self):
-        async with self.session.get(f"{self.base}/api/config") as r:
-            cfg = await r.json()
+        cfg = await self.get_json("/api/config")
         tx = pick(cfg, "transmit", default={})
         if not self.my_num:
-            self.my_num = (node_num(pick(tx, "node_id_hex", "node_id")) or random.getrandbits(32))
+            self.my_num = node_num(pick(tx, "node_id_hex", "node_id")) or mac_node_num()
+            if not self.my_num:
+                self.my_num = random.randint(4, 0xFFFFFFFE)
+                log.warning("no node id in config and no usable MAC address: using random id %s "
+                            "(it will change on restart; pass --node-id to pin it)", node_id(self.my_num))
         self.long_name = pick(tx, "long_name", default=self.long_name)
         self.short_name = pick(tx, "short_name", default=self.short_name)
         self.hop_limit = int(pick(tx, "hop_limit", default=3))
@@ -386,11 +525,8 @@ class Bridge:
         self.region = REGION_MAP.get(reg, reg)
         self.preset = snake_upper(pick(radio, "current_preset", "modem_preset", "preset", default="LongFast"))
         dev = pick(cfg, "device", default={})
-        try:
-            if pick(dev, "latitude") is not None and pick(dev, "longitude") is not None:
-                self.own_pos = (float(dev["latitude"]), float(dev["longitude"]), pick(dev, "altitude"))
-        except (TypeError, ValueError):
-            self.own_pos = None
+        pos = valid_position(pick(dev, "latitude"), pick(dev, "longitude"))
+        self.own_pos = (*pos, pick(dev, "altitude")) if pos else None
         log.info("Own map pin: %s", "from Meshpoint config (device location)" if self.own_pos
                  else "none (no location in Meshpoint config)")
         default_name = preset_display_name(self.preset)
@@ -488,10 +624,10 @@ class Bridge:
                     pass
             return ni
         ni.last_heard = to_epoch(pick(d, "last_heard", "lastHeard", "last_seen", "timestamp"))
-        lat, lon = pick(d, "latitude", "lat"), pick(d, "longitude", "lon", "lng")
-        if lat is not None and lon is not None:
+        pos = valid_position(pick(d, "latitude", "lat"), pick(d, "longitude", "lon", "lng"))
+        if pos:  # missing or 0,0 means "no GPS fix": leave the position unset
             try:
-                ni.position.latitude_i, ni.position.longitude_i = int(float(lat) * 1e7), int(float(lon) * 1e7)
+                ni.position.latitude_i, ni.position.longitude_i = int(pos[0] * 1e7), int(pos[1] * 1e7)
                 ni.position.time = ni.last_heard
                 if pick(d, "altitude") is not None:
                     ni.position.altitude = int(float(pick(d, "altitude")))
@@ -504,11 +640,28 @@ class Bridge:
             ni.snr = snr
         return ni
 
+    def new_packet(self, frm, to, portnum, payload, request_id=None, ack=False):
+        """A decoded MeshPacket from `frm` to `to` with the usual id / rx_time boilerplate filled in."""
+        pkt = mesh_pb2.MeshPacket()
+        setattr(pkt, "from", frm)
+        pkt.to = to
+        pkt.id = random.randint(1, 0xFFFFFFFF)
+        pkt.rx_time = int(time.time())
+        if ack:
+            pkt.priority = mesh_pb2.MeshPacket.ACK
+        pkt.decoded.portnum = portnum
+        pkt.decoded.payload = payload
+        if request_id is not None:
+            pkt.decoded.request_id = request_id
+        return pkt
+
     def environment_telemetry_packet(self, num, d):
         """Build a TELEMETRY_APP packet for Meshpoint temperature/humidity readings."""
         temperature = finite_float(pick(d, "latest_temperature", "temperature"))
         humidity = finite_float(pick(d, "latest_humidity", "humidity", "relative_humidity"))
-        if temperature is None and (humidity is None or not 0 <= humidity <= 100):
+        if humidity is not None and not 0 <= humidity <= 100:
+            humidity = None
+        if temperature is None and humidity is None:
             return None
 
         heard = to_epoch(pick(d, "last_heard", "lastHeard", "last_seen", "timestamp"))
@@ -517,13 +670,10 @@ class Bridge:
         telemetry.time = sample_time
         if temperature is not None:
             telemetry.environment_metrics.temperature = temperature
-        if humidity is not None and 0 <= humidity <= 100:
+        if humidity is not None:
             telemetry.environment_metrics.relative_humidity = humidity
 
-        pkt = mesh_pb2.MeshPacket()
-        setattr(pkt, "from", num)
-        pkt.to = BROADCAST
-        pkt.id = random.getrandbits(32)
+        pkt = self.new_packet(num, BROADCAST, portnums_pb2.TELEMETRY_APP, telemetry.SerializeToString())
         pkt.rx_time = sample_time
         rssi = finite_float(pick(d, "latest_rssi", "rssi"))
         snr = finite_float(pick(d, "latest_snr", "snr"))
@@ -531,58 +681,42 @@ class Bridge:
             pkt.rx_rssi = int(round(rssi))
         if snr is not None:
             pkt.rx_snr = snr
-        pkt.decoded.portnum = portnums_pb2.TELEMETRY_APP
-        pkt.decoded.payload = telemetry.SerializeToString()
         return pkt
-
-    def routing_ack(self, pkt):
-        ack = mesh_pb2.MeshPacket()
-        setattr(ack, "from", self.my_num)
-        ack.to = self.my_num
-        ack.id = random.getrandbits(32)
-        ack.priority = mesh_pb2.MeshPacket.ACK
-        ack.rx_time = int(time.time())
-        ack.decoded.portnum = portnums_pb2.ROUTING_APP
-        ack.decoded.request_id = pkt.id
-        ack.decoded.payload = mesh_pb2.Routing(error_reason=mesh_pb2.Routing.NONE).SerializeToString()
-        return ack
 
     def routing_packet(self, frm, request_id, error=mesh_pb2.Routing.NONE):
         """A routing ack/nak that appears to come from node `frm`, answering the phone's packet `request_id`."""
-        rp = mesh_pb2.MeshPacket()
-        setattr(rp, "from", frm)
-        rp.to = self.my_num
-        rp.id = random.getrandbits(32)
-        rp.priority = mesh_pb2.MeshPacket.ACK
-        rp.rx_time = int(time.time())
-        rp.decoded.portnum = portnums_pb2.ROUTING_APP
-        rp.decoded.request_id = request_id
-        rp.decoded.payload = mesh_pb2.Routing(error_reason=error).SerializeToString()
-        return rp
+        return self.new_packet(frm, self.my_num, portnums_pb2.ROUTING_APP,
+                               mesh_pb2.Routing(error_reason=error).SerializeToString(),
+                               request_id=request_id, ack=True)
 
-    def routing_error(self, pkt, reason=mesh_pb2.Routing.NO_INTERFACE):
-        ack = self.routing_ack(pkt)
-        ack.decoded.payload = mesh_pb2.Routing(error_reason=reason).SerializeToString()
-        return ack
+    def ack_for(self, pkt, ok=True):
+        """The bridge's own ack (or failure) for a packet the phone sent."""
+        return self.routing_packet(self.my_num, pkt.id,
+                                   mesh_pb2.Routing.NONE if ok else mesh_pb2.Routing.NO_INTERFACE)
 
     # ---- sending to phones
     def next_id(self):
         self.fr_id += 1
         return self.fr_id
 
-    async def to_client(self, c, **kw):
+    def build(self, **kw):
         fr = mesh_pb2.FromRadio()
         fr.id = self.next_id()
         for k, v in kw.items():
             getattr(fr, k).CopyFrom(v)
-        await c.send(fr)
+        return fr
 
-    async def broadcast(self, **kw):
+    async def to_client(self, c, **kw):
+        await c.send(self.build(**kw))
+
+    def broadcast(self, **kw):
+        """Queue a frame for every ready phone; one that has fallen too far behind is dropped."""
+        fr = self.build(**kw)
         for c in [c for c in self.clients if c.ready]:
-            try:
-                await self.to_client(c, **kw)
-            except Exception as e:  # noqa
-                log.debug("client send failed: %s", e)
+            if not c.try_send(fr):
+                log.warning("phone %s is not keeping up (send queue full); disconnecting it", c.peer)
+                self.clients.discard(c)
+                c.close()
 
     def make_config(self, kind):
         cfg = config_pb2.Config()
@@ -688,18 +822,12 @@ class Bridge:
             else:
                 log.info("admin: %s not supported", which)
         if answered:
-            rp = mesh_pb2.MeshPacket()
-            setattr(rp, "from", self.my_num)
-            rp.to = self.my_num
-            rp.id = random.getrandbits(32)
-            rp.rx_time = int(time.time())
-            rp.decoded.portnum = portnums_pb2.ADMIN_APP
-            rp.decoded.payload = resp.SerializeToString()
-            rp.decoded.request_id = pkt.id
+            rp = self.new_packet(self.my_num, self.my_num, portnums_pb2.ADMIN_APP,
+                                 resp.SerializeToString(), request_id=pkt.id)
             await self.to_client(c, packet=rp)
             log.debug("admin: answered %s", which)
         elif pkt.want_ack:
-            await self.to_client(c, packet=self.routing_ack(pkt))
+            await self.to_client(c, packet=self.ack_for(pkt))
             log.debug("admin: acked %s (not applied)", which)
 
     # ---- phone -> mesh
@@ -715,28 +843,29 @@ class Bridge:
             text = pkt.decoded.payload.decode("utf-8", "replace")
             ok, mp_id = False, None
             try:
-                async with self.session.post(f"{self.base}/api/messages/send",
-                                             json=build_tx_body(text, pkt.to, pkt.channel, pkt.want_ack)) as r:
-                    ok = r.status < 300
-                    body = await r.text()
-                    log.debug("send response: %s %s", r.status, body[:200])
-                    if not ok:
-                        log.warning("send failed: %s %s", r.status, body[:200])
-                    else:
-                        try:
-                            mp_id = parse_packet_id(pick(json.loads(body), "packet_id", "id"))
-                        except ValueError:
-                            pass
+                status, body = await self.call("POST", "/api/messages/send",
+                                               json=build_tx_body(text, pkt.to, pkt.channel, pkt.want_ack))
+                ok = status < 300
+                log.debug("send response: %s %s", status, body[:200])
+                if not ok:
+                    log.warning("send failed: %s %s", status, body[:200])
+                else:
+                    try:
+                        mp_id = parse_packet_id(pick(json.loads(body), "packet_id", "id"))
+                    except ValueError:
+                        pass
             except Exception as e:  # noqa
-                log.warning("send error: %s", e)
+                log.warning("send error: %r", e)
             tracked = False
             if ok and pkt.want_ack and pkt.to != BROADCAST and mp_id is not None:
                 # DM: wait for the recipient's real ack instead of claiming delivery right away
                 self.pending[mp_id] = (pkt.id, pkt.to)
-                asyncio.create_task(self.ack_timeout(mp_id))
+                task = asyncio.create_task(self.ack_timeout(mp_id))
+                self.tasks.add(task)  # keep a reference so it isn't garbage-collected mid-sleep
+                task.add_done_callback(self.tasks.discard)
                 tracked = True
             if pkt.want_ack and not tracked:
-                await self.to_client(c, packet=self.routing_ack(pkt) if ok else self.routing_error(pkt))
+                await self.to_client(c, packet=self.ack_for(pkt, ok))
             dest = "broadcast" if pkt.to == BROADCAST else node_id(pkt.to)
             log.info("TX text -> %s ch%d ok=%s%s: %r", dest, pkt.channel, ok,
                      " (waiting for recipient ack)" if tracked else "", text)
@@ -755,7 +884,7 @@ class Bridge:
             else:
                 log.info("ignoring unsupported TX portnum %s", name)
             if pkt.want_ack or port == portnums_pb2.TRACEROUTE_APP:  # fail fast instead of leaving the app waiting
-                await self.to_client(c, packet=self.routing_error(pkt))
+                await self.to_client(c, packet=self.ack_for(pkt, ok=False))
 
     async def ack_timeout(self, mp_id, seconds=60):
         """No confirmation from the recipient: settle the app on 'relayed, not confirmed' instead of hanging."""
@@ -764,7 +893,7 @@ class Bridge:
         if entry:
             log.info("no confirmation from %s within %ds; app shows 'relayed, not confirmed'",
                      node_id(entry[1]), seconds)
-            await self.broadcast(packet=self.routing_packet(self.my_num, entry[0]))
+            self.broadcast(packet=self.routing_packet(self.my_num, entry[0]))
 
     async def on_routing_event(self, d, dp):
         """An ack/nak addressed to the Meshpoint: pass the recipient's real confirmation to the app."""
@@ -785,9 +914,9 @@ class Bridge:
         if not entry:
             log.info("routing packet from %s not matched to a pending DM: %s", node_id(src), json.dumps(dp)[:200])
             return
-        phone_id, dest = entry
+        phone_id = entry[0]
         log.info("DM %s by %s", "confirmed" if err == 0 else f"failed (error {err})", node_id(src))
-        await self.broadcast(packet=self.routing_packet(src, phone_id, err))
+        self.broadcast(packet=self.routing_packet(src, phone_id, err))
 
     async def share_nodeinfo(self, c, pkt):
         """The app's 'exchange user info': have the Meshpoint broadcast its own NodeInfo now.
@@ -800,19 +929,28 @@ class Bridge:
             ok = True
         else:
             try:
-                async with self.session.post(f"{self.base}/api/config/nodeinfo/send") as r:
-                    ok = r.status < 300
-                    body = await r.text()
-                    log.info("user info request -> Meshpoint broadcasting its NodeInfo: %s %s", r.status, body[:120])
-                    if ok:
-                        self.last_nodeinfo_tx = time.time()
+                status, body = await self.call("POST", "/api/config/nodeinfo/send")
+                ok = status < 300
+                log.info("user info request -> Meshpoint broadcasting its NodeInfo: %s %s", status, body[:120])
+                if ok:
+                    self.last_nodeinfo_tx = time.time()
             except Exception as e:  # noqa
-                log.warning("nodeinfo send error: %s", e)
+                log.warning("nodeinfo send error: %r", e)
         if pkt.want_ack:
-            await self.to_client(c, packet=self.routing_ack(pkt) if ok else self.routing_error(pkt))
+            await self.to_client(c, packet=self.ack_for(pkt, ok))
 
     # ---- mesh -> phone
-    async def on_node_event(self, ptype, d, dp):
+    def seen_before(self, pid):
+        """True if this packet id was already forwarded; otherwise remember it (bounded, oldest evicted)."""
+        if pid in self.seen_set:
+            return True
+        if len(self.seen) == self.seen.maxlen:
+            self.seen_set.discard(self.seen[0])
+        self.seen.append(pid)
+        self.seen_set.add(pid)
+        return False
+
+    def on_node_event(self, ptype, d, dp):
         """Heard a NodeInfo (user info) or Position packet: update that node in the app right away."""
         num = node_num(d.get("source_id"))
         if num is None or num == self.my_num:
@@ -825,19 +963,20 @@ class Bridge:
                     cur[dst] = dp[src]
             log.info("RX user info from %s: %s (%s)", node_id(num), cur.get("long_name"), cur.get("short_name"))
         else:
-            if dp.get("latitude") is None or dp.get("longitude") is None:
+            pos = valid_position(dp.get("latitude"), dp.get("longitude"))
+            if pos is None:  # no fix / 0,0: ignore
                 return
-            cur["latitude"], cur["longitude"] = dp["latitude"], dp["longitude"]
+            cur["latitude"], cur["longitude"] = pos
             for k in ("altitude", "precision_bits"):
                 if dp.get(k) is not None:
                     cur[k] = dp[k]
-            log.debug("RX position from %s: %s,%s", node_id(num), dp["latitude"], dp["longitude"])
+            log.debug("RX position from %s: %s,%s", node_id(num), *pos)
         cur["last_heard"] = d.get("timestamp")
         sig = d.get("signal") or {}
         if sig.get("snr") is not None:
             cur["latest_snr"] = sig["snr"]
-        self.nodes[num], self.node_sig[num] = cur, node_sig(cur)
-        await self.broadcast(node_info=self.nodeinfo(num, cur))
+        self.nodes[num], self.node_sig[num] = cur, signature(cur, NODE_SIG_KEYS)
+        self.broadcast(node_info=self.nodeinfo(num, cur))
 
     async def on_event(self, ev):
         if ev.get("type") != "packet" or not isinstance(ev.get("data"), dict):
@@ -848,7 +987,7 @@ class Bridge:
         dp = d.get("decoded_payload")
         ptype = str(d.get("packet_type", "")).lower()
         if ptype in ("nodeinfo", "position") and isinstance(dp, dict):
-            await self.on_node_event(ptype, d, dp)
+            self.on_node_event(ptype, d, dp)
             return
         if ptype.startswith("routing") and isinstance(dp, dict):
             await self.on_routing_event(d, dp)
@@ -859,11 +998,8 @@ class Bridge:
                 log.warning("text-type packet but no text field found; decoded_payload=%r", dp)
             return  # only text is forwarded in this draft
         pid = str(d.get("packet_id", ""))
-        if pid and pid in self.seen_ids:
+        if pid and self.seen_before(pid):
             return
-        self.seen_ids.add(pid)
-        if len(self.seen_ids) > 2000:
-            self.seen_ids.clear()
         src = node_num(d.get("source_id"))
         dst = node_num(d.get("destination_id"))
         dst = BROADCAST if dst is None else dst
@@ -895,11 +1031,18 @@ class Bridge:
             pkt.rx_rssi = int(float(sig["rssi"]))
         pkt.decoded.portnum = portnums_pb2.TEXT_MESSAGE_APP
         pkt.decoded.payload = text.encode()
-        await self.broadcast(packet=pkt)
+        if isinstance(dp, dict):  # replies and tapbacks (field names unverified: check with --probe)
+            reply = parse_packet_id(pick(dp, "reply_id", "replyId"))
+            if reply:
+                pkt.decoded.reply_id = reply & 0xFFFFFFFF
+            if pick(dp, "emoji") not in (None, "", 0, False, "0"):
+                pkt.decoded.emoji = 1  # flag only; the emoji glyph itself is the text payload
+        self.broadcast(packet=pkt)
         log.info("RX text from %s ch%s: %r", node_id(src), chan, text[:40])
 
     async def ws_loop(self):
         while True:
+            gen = self.login_gen
             try:
                 async with self.session.ws_connect(f"{self.base}/ws", heartbeat=30) as ws:
                     log.info("connected to Meshpoint websocket")
@@ -910,14 +1053,20 @@ class Bridge:
                             except ValueError:
                                 continue
                             if isinstance(ev, dict):
-                                await self.on_event(ev)
+                                try:  # one bad event must not drop the connection
+                                    await self.on_event(ev)
+                                except Exception:  # noqa
+                                    log.exception("event handling failed")
+            except aiohttp.WSServerHandshakeError as e:
+                log.warning("ws handshake failed: %s (retrying)", e.status)
+                if e.status == 401:
+                    await self.relogin(gen)
             except Exception as e:  # noqa
                 log.warning("ws error: %s (retrying)", e)
             await asyncio.sleep(5)
 
     async def poll_nodes(self):
-        async with self.session.get(f"{self.base}/api/nodes") as r:
-            data = await r.json()
+        data = await self.get_json("/api/nodes")
         items = data if isinstance(data, list) else pick(data, "nodes", "items", "data", default=[])
         for d in items:
             if str(pick(d, "protocol", default="meshtastic")).lower() == "meshcore":
@@ -925,21 +1074,25 @@ class Bridge:
             num = node_num(pick(d, "node_id", "id", "nodeId", "num"))
             if num is None or num == self.my_num:
                 continue
-            sig = node_sig(d)
-            old_sig = self.node_sig.get(num)
+            old = self.nodes.get(num)
+            if old and to_epoch(pick(old, "last_heard")) > to_epoch(pick(d, "last_heard")):
+                d = {**d, **old}  # a live event is newer than what the API returned: keep it
+            else:
+                d = {**(old or {}), **d}
             self.nodes[num] = d
-            if old_sig != sig:
+            sig = signature(d, NODE_SIG_KEYS)
+            if self.node_sig.get(num) != sig:
                 self.node_sig[num] = sig
-                await self.broadcast(node_info=self.nodeinfo(num, d))
+                self.broadcast(node_info=self.nodeinfo(num, d))
 
             # Temperature/humidity are separate Telemetry packets. Avoid repeating
             # an unchanged sensor reading just because last_heard was refreshed.
-            env_sig = environment_sig(d)
+            env_sig = signature(d, ENVIRONMENT_SIG_KEYS)
             if self.env_sig.get(num) != env_sig:
                 self.env_sig[num] = env_sig
                 env_packet = self.environment_telemetry_packet(num, d)
                 if env_packet is not None:
-                    await self.broadcast(packet=env_packet)
+                    self.broadcast(packet=env_packet)
 
     async def nodes_loop(self):
         while True:
@@ -947,7 +1100,7 @@ class Bridge:
             try:
                 await self.poll_nodes()
             except Exception as e:  # noqa
-                log.warning("node poll error: %s", e)
+                log.warning("node poll error: %r", e)
 
     # ---- TCP server
     async def handle_client(self, reader, writer):
@@ -957,7 +1110,7 @@ class Bridge:
         for old in list(self.clients):
             log.info("closing previous phone connection %s (replaced by %s)", old.peer, peer)
             self.clients.discard(old)
-            old.writer.close()
+            old.close()
         c.peer = peer
         self.clients.add(c)
         log.info("phone connected: %s", peer)
@@ -974,9 +1127,13 @@ class Bridge:
         reason = "closed by phone"
         try:
             while True:
+                # find the 0x94 0xC3 frame start; tolerate repeated 0x94 bytes before the 0xC3
                 if (await reader.readexactly(1))[0] != START1:
                     continue
-                if (await reader.readexactly(1))[0] != START2:
+                b = (await reader.readexactly(1))[0]
+                while b == START1:
+                    b = (await reader.readexactly(1))[0]
+                if b != START2:
                     continue
                 n = int.from_bytes(await reader.readexactly(2), "big")
                 if n > 512:
@@ -1003,23 +1160,24 @@ class Bridge:
         except asyncio.CancelledError:
             reason = "bridge shutting down"
             raise
-        except (asyncio.IncompleteReadError, OSError) as e:  # OSError covers resets and timeouts
-            reason = f"connection lost ({type(e).__name__}: {e})" if not isinstance(e, asyncio.IncompleteReadError) \
-                else "closed by phone"
+        except asyncio.IncompleteReadError:
+            reason = "closed by phone"
+        except OSError as e:  # covers resets and timeouts
+            reason = f"connection lost ({type(e).__name__}: {e})"
         except Exception as e:  # noqa
             reason = f"error {e!r}"
             log.exception("client handler crashed")
         finally:
             was_current = c in self.clients
             self.clients.discard(c)
-            writer.close()
-            log.info("phone disconnected %s: %s%s", peer, reason, "" if was_current else " (already replaced)")
+            c.close()
+            log.info("phone disconnected %s: %s%s", peer, reason, "" if was_current else " (already removed)")
 
     async def run(self):
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None, connect=10),
                                          cookie_jar=aiohttp.CookieJar(unsafe=True),
                                          connector=aiohttp.TCPConnector(force_close=True)) as self.session:
-            await ensure_login(self.session, self.base, self.args)
+            self.creds = await ensure_login(self.session, self.base, self.args)
             await self.load_config()
             await self.poll_nodes()
             log.info("loaded %d nodes", len(self.nodes))
@@ -1028,8 +1186,17 @@ class Bridge:
             try:
                 await asyncio.gather(server.serve_forever(), self.ws_loop(), self.nodes_loop())
             finally:
+                server.close()
+                for c in list(self.clients):
+                    c.close()
+                for t in list(self.tasks):
+                    t.cancel()
                 if azc:
-                    await azc.async_close()
+                    try:  # send mDNS goodbyes so phones drop the entry right away
+                        await azc.async_unregister_all_services()
+                        await azc.async_close()
+                    except Exception as e:  # noqa
+                        log.debug("mDNS shutdown error: %r", e)
 
     async def advertise(self):
         try:
@@ -1073,11 +1240,10 @@ async def probe(args):
                     paths = spec.get("paths", {})
                     print("\n=== API paths ===")
                     print(", ".join(f"{m.upper()} {p}" for p, v in sorted(paths.items()) for m in v))
-                    for pth in ("/api/messages/send",):
-                        op = paths.get(pth, {}).get("post", {})
-                        body = (op.get("requestBody", {}).get("content", {}).get("application/json", {}).get("schema", {}))
-                        print(f"\n=== POST {pth} request body schema ===")
-                        print(json.dumps(resolve_schema(spec, body), indent=1)[:3000])
+                    op = paths.get("/api/messages/send", {}).get("post", {})
+                    body = (op.get("requestBody", {}).get("content", {}).get("application/json", {}).get("schema", {}))
+                    print("\n=== POST /api/messages/send request body schema ===")
+                    print(json.dumps(resolve_schema(spec, body), indent=1)[:3000])
                 else:
                     print(f"\n(openapi.json -> {r.status}; send schema not available)")
         except Exception as e:  # noqa
@@ -1108,6 +1274,18 @@ async def probe(args):
             print("ws failed:", e)
 
 
+async def amain(args):
+    """Run the bridge (or probe). SIGINT/SIGTERM cancel it cleanly so mDNS goodbyes and sockets get closed."""
+    task = asyncio.current_task()
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, task.cancel)
+    try:
+        await (probe(args) if args.probe else Bridge(args).run())
+    except asyncio.CancelledError:
+        log.info("shutting down")
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--meshpoint", default="127.0.0.1:8080", help="host:port of the Meshpoint API")
@@ -1123,7 +1301,7 @@ def main():
     args = p.parse_args()
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
                         format="%(asctime)s %(levelname)s %(message)s")
-    asyncio.run(probe(args) if args.probe else Bridge(args).run())
+    asyncio.run(amain(args))
 
 
 if __name__ == "__main__":

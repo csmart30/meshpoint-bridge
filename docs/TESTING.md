@@ -2,16 +2,16 @@
 
 ## Tested platform
 
-The bridge is designed around Meshpoint's HTTP REST API and WebSocket, rather than any specific radio/concentrator hardware. It can run on the Meshpoint host or on another Python-capable machine with network access to the Meshpoint API. This test record covers only the installation below.
+The bridge is designed around Meshpoint's HTTP REST API and WebSocket, rather than any specific radio/concentrator hardware. It is intended to run on the Linux device that runs Meshpoint, using the local Meshpoint API. This test record covers only the installation below.
 
 - Hardware: RAK Miner V2 (Meshpoint's hardware matrix refers to the prebuilt unit as RAK Hotspot V2 / RAK7248).
 - Software under test: Meshpoint plus `meshpoint_bridge.py` on the same host.
 - Bridge connection: Meshpoint API on the local host, Meshtastic TCP listener on port `4403`.
 - Test date: November 10, 2026.
-- Host OS: Debeian 13.6
+- Host OS: Debian 13.6
 - Python version: 3.13.5
 - Meshpoint version: v0.7.9
-- Meshtastic Moble App Version: 2.7.28 (2718)
+- Meshtastic Mobile App Version: 2.7.28 (2718)
 - Client device: iPhone 16e
 
 ## Verified in the live test
@@ -27,7 +27,7 @@ The bridge is designed around Meshpoint's HTTP REST API and WebSocket, rather th
 
 ## Not established by this test
 
-- Compatibility with other Meshpoint host hardware or deployment types. The bridge is intended to be hardware-agnostic, but those combinations have not been tested here.
+- Compatibility with other Meshpoint host hardware or deployment types. The bridge is intended to be hardware-agnostic, but those combinations have not been tested here. Running the bridge on a different machine than Meshpoint is not a supported configuration.
 - Compatibility with all Meshpoint or Meshtastic app versions.
 - Other Meshtastic portnums, admin operations, and device-management workflows.
 - Five-day node retention, local persistent favorites, or systemd boot startup; those features are not implemented in this snapshot.
@@ -49,3 +49,17 @@ The app display of hop count and battery percentage has been verified. Individua
 ### Hop-count observation
 
 The client-base node advertises Meshpoint as one of its direct neighbors, while the Meshpoint dashboard reports the client-base node as one hop away. This discrepancy is visible in Meshpoint itself. The bridge maps `latest_hops` to `NodeInfo.hops_away` without calculating a route, subtracting a hop, or applying another correction. The cause of the discrepancy has not been established.
+
+## Pending verification: hardening update
+
+The following behavior was added after the November 10, 2026 session and has **not** been tested on hardware. The standard-library unit tests cover the pure helper functions (position validation, timestamp parsing, MAC-based node ID selection, duplicate tracking, schema resolution). Everything below needs a live pass; record the date, Meshpoint version, and result next to each item when done.
+
+- [ ] **Stable node ID:** restart the bridge without `--node-id` and confirm the node ID in the app stays the same and matches the last four bytes of the expected MAC address (Ethernet if present, otherwise Wi-Fi). Expect the ID to change once compared with the earlier random ID.
+- [ ] **Session expiry:** invalidate the dashboard session (or wait for it to expire), then send a message from the app. Expect an "logging in again" log line and a successful send. Also confirm that a wrong stored password produces one failed login and then a 5-minute pause, not repeated attempts.
+- [ ] **0,0 positions:** with a node reporting latitude/longitude of exactly 0,0, confirm the app shows no map position for it.
+- [ ] **Stalled phone:** disable the phone's Wi-Fi or suspend the app mid-session, and confirm other traffic is not delayed and the dead connection is dropped.
+- [ ] **Malformed event:** confirm that an event the bridge cannot handle produces an "event handling failed" log entry without a WebSocket reconnect.
+- [ ] **Replies and tapbacks:** send a reply and a tapback from another node, capture the event with `--probe`, and confirm the field names (`reply_id`, `emoji`) and that the app displays them correctly. Update the code if the names differ.
+- [ ] **Shutdown:** stop the bridge with Ctrl-C and with `kill -TERM`; confirm the "shutting down" log line, that the mDNS entry disappears from the phone's list, and that the listening port is released.
+- [ ] **Timestamps:** confirm `last_heard` times in the app match Meshpoint's dashboard, in particular for any timestamps Meshpoint reports without a timezone.
+- [ ] **Regression:** repeat the earlier broadcast, direct-message, acknowledgement, and metadata checks to confirm nothing changed.
