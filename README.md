@@ -20,6 +20,8 @@ On November 10, 2026, the following behavior was verified against the live insta
 - A response received by Meshpoint was forwarded to the native app on channel index `2`.
 - Direct messages were transmitted and the bridge received recipient routing acknowledgements.
 - NodeInfo and position updates were received from Meshpoint and forwarded to the app.
+- A subsequent metadata update displayed hop count and battery percentage in the native Meshtastic app.
+- The client-base node advertises Meshpoint as a direct neighbor, while Meshpoint's dashboard reports that node as one hop away. The bridge forwards Meshpoint's `latest_hops` value unchanged; the cause of the discrepancy is unknown.
 
 This is a report of one working installation, not a claim that every Meshpoint version, host platform, Meshtastic app version, or packet type has been tested. The exact OS, Python, Meshpoint, and mobile-app version numbers were not recorded in the test session.
 
@@ -51,12 +53,14 @@ The bridge presents a virtual Meshtastic node to the phone. Meshpoint remains re
 - Text-message TX through Meshpoint's REST API.
 - Text-message RX through Meshpoint's WebSocket.
 - Direct-message acknowledgement tracking when Meshpoint returns a correlatable packet ID and a recipient acknowledgement is observed.
-- Basic NodeInfo and position forwarding.
+- NodeInfo and position forwarding, including Meshpoint-reported hop count and SNR.
+- Device-metric forwarding for battery percentage, voltage, channel utilization, and transmit airtime utilization when Meshpoint supplies those values. Hop count and battery percentage have been observed in the native app; the other metrics still need individual live verification.
+- Environmental temperature and relative-humidity forwarding through Meshtastic `TELEMETRY_APP`; both have been verified in the native app and matched Meshpoint readings.
 - Read-only responses to selected admin queries.
 
 ## Current limitations / planned work
 
-The following are **not implemented in this initial repository snapshot**:
+The following are **not implemented yet**:
 
 - Five-day node-list retention with older nodes retained only when locally favorited.
 - Persisting favorite/unfavorite actions from the native Meshtastic app to a bridge-local favorites file. The current bridge acknowledges `set_favorite_node` but does not persist it.

@@ -2,6 +2,16 @@
 
 This roadmap records intended work. Items below should not be interpreted as implemented features.
 
+## Implemented in the current development update (partially live-verified)
+
+- Map Meshpoint `latest_hops` into Meshtastic `NodeInfo.hops_away`.
+- Map battery level, voltage, channel utilization, transmit airtime utilization, and SNR into the corresponding Meshtastic node fields.
+- Forward available temperature and relative-humidity readings as `TELEMETRY_APP` environment metrics.
+- Refresh node metadata when the mapped values change, without repeatedly sending unchanged temperature/humidity readings.
+- Add standard-library unit tests for these mappings.
+
+Live app testing on the RAK Miner V2 confirmed that hop count and battery percentage appear in the native Meshtastic app. The client-base node has a known hop-count discrepancy already present in Meshpoint; the bridge passes the Meshpoint value through unchanged. Temperature and humidity have been verified in the native app and matched Meshpoint readings. Individual verification of voltage, channel utilization, transmit airtime utilization, and SNR remains outstanding.
+
 ## Next milestone
 
 1. **Node retention:** include nodes whose `last_heard` value is within the previous five days.
@@ -26,3 +36,8 @@ This roadmap records intended work. Items below should not be interpreted as imp
 - Reconcile stale node records as Meshpoint's database changes.
 - Expand selected packet-type support after the text, node, and acknowledgement paths have regression coverage.
 - Document supported Meshpoint and Meshtastic app version ranges as they are tested.
+
+
+## Follow-up investigation
+
+- Investigate incoming direct-message acknowledgements. Meshpoint logs show `TX routing ACK OK`, but the sending node does not appear to receive or accept the acknowledgement. This is being tracked separately from bridge functionality until the cause is established.

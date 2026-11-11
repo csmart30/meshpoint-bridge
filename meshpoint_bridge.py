@@ -24,6 +24,7 @@ import base64
 import getpass
 import json
 import logging
+import math
 import os
 import random
 import re
@@ -34,7 +35,9 @@ from datetime import datetime
 
 import aiohttp
 from google.protobuf.message import DecodeError
-from meshtastic.protobuf import admin_pb2, channel_pb2, config_pb2, mesh_pb2, portnums_pb2
+from meshtastic.protobuf import (
+    admin_pb2, channel_pb2, config_pb2, mesh_pb2, portnums_pb2, telemetry_pb2,
+)
 
 START1, START2 = 0x94, 0xC3
 BROADCAST = 0xFFFFFFFF
@@ -140,12 +143,35 @@ def trunc_utf8(text, max_bytes):
     return str(text).encode()[:max_bytes].decode("utf-8", "ignore")
 
 
-NODE_SIG_KEYS = ("long_name", "short_name", "latitude", "longitude", "altitude",
-                 "hardware_model", "public_key", "role")
+# Fields from Meshpoint that should refresh the phone's node record when they change.
+# Device metrics are exposed on NodeInfo.device_metrics; temperature and humidity
+# are sent separately as TELEMETRY_APP / EnvironmentMetrics packets.
+NODE_SIG_KEYS = (
+    "long_name", "short_name", "latitude", "longitude", "altitude",
+    "hardware_model", "public_key", "role", "last_heard",
+    "latest_snr", "latest_hops", "latest_battery",
+    "latest_voltage", "latest_channel_util", "latest_air_util",
+)
 
+ENVIRONMENT_SIG_KEYS = ("latest_temperature", "latest_humidity")
 
 def node_sig(d):
     return json.dumps({k: d.get(k) for k in NODE_SIG_KEYS}, sort_keys=True, default=str)
+
+
+def environment_sig(d):
+    return json.dumps({k: d.get(k) for k in ENVIRONMENT_SIG_KEYS}, sort_keys=True, default=str)
+
+
+def finite_float(value):
+    """Return a finite float for a Meshpoint metric, or None when absent/invalid."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    return result if math.isfinite(result) else None
 
 
 def snake_upper(s):
@@ -330,6 +356,7 @@ class Bridge:
         self.clients = set()
         self.nodes = {}
         self.node_sig = {}
+        self.env_sig = {}
         self.my_num = node_num(args.node_id) or 0
         self.long_name, self.short_name = "Meshpoint", "MPNT"
         self.region, self.preset = "US", "LONG_FAST"
@@ -418,6 +445,34 @@ class Bridge:
                     ni.user.role = int(role)
             except (TypeError, ValueError):
                 pass
+
+            # Meshpoint's hop count maps directly to Meshtastic NodeInfo.hops_away.
+            hops = pick(d, "latest_hops", "hops_away")
+            if hops is not None:
+                try:
+                    hops = int(float(hops))
+                    if hops >= 0:
+                        ni.hops_away = hops
+                except (TypeError, ValueError, OverflowError):
+                    pass
+
+            # DeviceMetrics is part of NodeInfo. Leave unavailable measurements
+            # unset rather than fabricating zero values.
+            battery = finite_float(pick(d, "latest_battery", "battery_level"))
+            voltage = finite_float(pick(d, "latest_voltage", "voltage"))
+            channel_util = finite_float(pick(d, "latest_channel_util", "channel_utilization"))
+            air_util = finite_float(pick(d, "latest_air_util", "air_util_tx"))
+            if battery is not None and battery >= 0:
+                # Meshtastic uses values over 100 to indicate an externally powered node.
+                ni.device_metrics.battery_level = int(round(battery))
+            if voltage is not None and voltage >= 0:
+                ni.device_metrics.voltage = voltage
+            if channel_util is not None and 0 <= channel_util <= 100:
+                ni.device_metrics.channel_utilization = channel_util
+            if air_util is not None and 0 <= air_util <= 100:
+                # Preserve the value Meshpoint reports; validate its displayed unit during hardware testing.
+                ni.device_metrics.air_util_tx = air_util
+
         if num == self.my_num:  # our own node: always "just heard", pinned at the Meshpoint's registered location
             now = int(time.time())
             ni.last_heard = now
@@ -434,19 +489,50 @@ class Bridge:
         ni.last_heard = to_epoch(pick(d, "last_heard", "lastHeard", "last_seen", "timestamp"))
         lat, lon = pick(d, "latitude", "lat"), pick(d, "longitude", "lon", "lng")
         if lat is not None and lon is not None:
-            ni.position.latitude_i, ni.position.longitude_i = int(float(lat) * 1e7), int(float(lon) * 1e7)
-            ni.position.time = ni.last_heard
             try:
+                ni.position.latitude_i, ni.position.longitude_i = int(float(lat) * 1e7), int(float(lon) * 1e7)
+                ni.position.time = ni.last_heard
                 if pick(d, "altitude") is not None:
                     ni.position.altitude = int(float(pick(d, "altitude")))
                 if pick(d, "precision_bits") is not None:
                     ni.position.precision_bits = int(pick(d, "precision_bits"))
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 pass
-        snr = pick(d, "latest_snr", "snr")
+        snr = finite_float(pick(d, "latest_snr", "snr"))
         if snr is not None:
-            ni.snr = float(snr)
+            ni.snr = snr
         return ni
+
+    def environment_telemetry_packet(self, num, d):
+        """Build a TELEMETRY_APP packet for Meshpoint temperature/humidity readings."""
+        temperature = finite_float(pick(d, "latest_temperature", "temperature"))
+        humidity = finite_float(pick(d, "latest_humidity", "humidity", "relative_humidity"))
+        if temperature is None and (humidity is None or not 0 <= humidity <= 100):
+            return None
+
+        heard = to_epoch(pick(d, "last_heard", "lastHeard", "last_seen", "timestamp"))
+        sample_time = heard or int(time.time())
+        telemetry = telemetry_pb2.Telemetry()
+        telemetry.time = sample_time
+        if temperature is not None:
+            telemetry.environment_metrics.temperature = temperature
+        if humidity is not None and 0 <= humidity <= 100:
+            telemetry.environment_metrics.relative_humidity = humidity
+
+        pkt = mesh_pb2.MeshPacket()
+        setattr(pkt, "from", num)
+        pkt.to = BROADCAST
+        pkt.id = random.getrandbits(32)
+        pkt.rx_time = sample_time
+        rssi = finite_float(pick(d, "latest_rssi", "rssi"))
+        snr = finite_float(pick(d, "latest_snr", "snr"))
+        if rssi is not None:
+            pkt.rx_rssi = int(round(rssi))
+        if snr is not None:
+            pkt.rx_snr = snr
+        pkt.decoded.portnum = portnums_pb2.TELEMETRY_APP
+        pkt.decoded.payload = telemetry.SerializeToString()
+        return pkt
 
     def routing_ack(self, pkt):
         ack = mesh_pb2.MeshPacket()
@@ -552,6 +638,9 @@ class Bridge:
         if not only_config:
             for num, d in list(self.nodes.items()):
                 await self.to_client(c, node_info=self.nodeinfo(num, d))
+                env_packet = self.environment_telemetry_packet(num, d)
+                if env_packet is not None:
+                    await self.to_client(c, packet=env_packet)
         fr = mesh_pb2.FromRadio()
         fr.id = self.next_id()
         fr.config_complete_id = nonce
@@ -836,11 +925,20 @@ class Bridge:
             if num is None or num == self.my_num:
                 continue
             sig = node_sig(d)
-            if self.node_sig.get(num) != sig:
-                self.node_sig[num], self.nodes[num] = sig, d
+            old_sig = self.node_sig.get(num)
+            self.nodes[num] = d
+            if old_sig != sig:
+                self.node_sig[num] = sig
                 await self.broadcast(node_info=self.nodeinfo(num, d))
-            else:
-                self.nodes[num] = d
+
+            # Temperature/humidity are separate Telemetry packets. Avoid repeating
+            # an unchanged sensor reading just because last_heard was refreshed.
+            env_sig = environment_sig(d)
+            if self.env_sig.get(num) != env_sig:
+                self.env_sig[num] = env_sig
+                env_packet = self.environment_telemetry_packet(num, d)
+                if env_packet is not None:
+                    await self.broadcast(packet=env_packet)
 
     async def nodes_loop(self):
         while True:
