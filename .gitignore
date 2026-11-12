@@ -29,6 +29,11 @@ var/
 logs/
 *.log
 
+# Local artifacts: patches and captured probe/log output (can contain node names, IDs and locations)
+*.patch
+*.diff
+probe*.txt
+
 # Editor/OS files
 .vscode/
 .idea/

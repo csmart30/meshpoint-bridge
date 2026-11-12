@@ -160,7 +160,7 @@ The username and password can also be supplied using `MESHPOINT_USERNAME` and `M
 - Keep Meshpoint's dashboard/API on a trusted network. The default API URL is loopback (`127.0.0.1:8080`) when the bridge runs on the Meshpoint host.
 - Never commit passwords, tokens, cookies, `.env` files, runtime state, or device-specific logs. The repository `.gitignore` excludes common secret and runtime paths, but always inspect `git status` before committing.
 - The dashboard credentials stay in the bridge process's memory while it runs, so it can log in again after a session expires.
-- Normal logging currently includes message text. Be mindful when sharing logs, especially when using DMs.
+- Logs can include message text, node names and node IDs, and `-v` adds more detail. Review them before posting them publicly, especially if you use DMs. Login responses are not logged.
 
 ## Development status
 

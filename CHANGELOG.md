@@ -23,6 +23,11 @@ Changed:
 - SIGINT/SIGTERM now shut the bridge down cleanly and unregister the mDNS service.
 - The bridge is documented as Linux-only and intended to run on the device that runs Meshpoint.
 
+Security / hygiene:
+
+- Debug logging no longer prints the Meshpoint login response body, which can contain a session token.
+- Added SPDX license identifiers to the Python files, and ignored local `*.patch`, `*.diff` and `probe*.txt` files in `.gitignore`.
+
 Cleanup:
 
 - Removed unused variables, merged the duplicate routing-ack builders and packet boilerplate, simplified change-detection signatures, fixed `resolve_schema` so `$ref` entries inside lists are resolved, and removed identity entries from the region map.
