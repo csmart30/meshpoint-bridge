@@ -19,7 +19,7 @@ Changed:
 
 - The virtual node ID now defaults to the Meshpoint configuration's ID, then the Ethernet MAC address, then the Wi-Fi MAC address (random only as a last resort). Installations that previously got a random ID will see one change.
 - Nodes (and the Meshpoint's own location) reporting latitude/longitude of exactly 0,0, or out-of-range values, are treated as having no position.
-- Replies and tapbacks received from the mesh are forwarded with their reply ID and tapback flag. Field names are unverified.
+- Replies and tapbacks received from the mesh are forwarded with their reply ID and tapback flag when Meshpoint provides them. A `--probe` check showed that Meshpoint does not currently include these fields, so this has no effect yet; an issue is being raised on Meshpoint.
 - SIGINT/SIGTERM now shut the bridge down cleanly and unregister the mDNS service.
 - The bridge is documented as Linux-only and intended to run on the device that runs Meshpoint.
 

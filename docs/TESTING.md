@@ -59,7 +59,7 @@ The following behavior was added after the November 10, 2026 session and has **n
 - [ ] **0,0 positions:** with a node reporting latitude/longitude of exactly 0,0, confirm the app shows no map position for it.
 - [ ] **Stalled phone:** disable the phone's Wi-Fi or suspend the app mid-session, and confirm other traffic is not delayed and the dead connection is dropped.
 - [ ] **Malformed event:** confirm that an event the bridge cannot handle produces an "event handling failed" log entry without a WebSocket reconnect.
-- [ ] **Replies and tapbacks:** send a reply and a tapback from another node, capture the event with `--probe`, and confirm the field names (`reply_id`, `emoji`) and that the app displays them correctly. Update the code if the names differ.
+- [x] **Replies and tapbacks:** checked November 11, 2026 with `--probe`. **Blocked on Meshpoint:** a tapback arrives as a plain text packet (`{"text": "😂"}`) with no `reply_id` or `emoji` field, so the app shows it as an ordinary emoji message. Meshpoint's send API also has no reply/tapback fields. See [ROADMAP.md](ROADMAP.md#replies-and-tapbacks).
 - [ ] **Shutdown:** stop the bridge with Ctrl-C and with `kill -TERM`; confirm the "shutting down" log line, that the mDNS entry disappears from the phone's list, and that the listening port is released.
 - [ ] **Timestamps:** confirm `last_heard` times in the app match Meshpoint's dashboard, in particular for any timestamps Meshpoint reports without a timezone.
 - [ ] **Regression:** repeat the earlier broadcast, direct-message, acknowledgement, and metadata checks to confirm nothing changed.

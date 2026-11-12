@@ -59,7 +59,7 @@ The bridge presents a virtual Meshtastic node to the phone. Meshpoint remains re
 - Read-only responses to selected admin queries.
 - A stable virtual node ID derived from the device's MAC address (see [Node identity](#node-identity)) *(not yet live-verified)*.
 - Nodes whose reported position is exactly 0,0 are treated as having no GPS position and are shown without a map pin *(not yet live-verified)*.
-- Replies and tapbacks received from the mesh are forwarded to the app with their reply ID and tapback flag. The Meshpoint field names for these are a best guess and still need checking with `--probe` *(not yet live-verified)*.
+- Receive-side support for replies and tapbacks: if a Meshpoint event carries a reply ID or tapback flag, it is forwarded to the app. Meshpoint does not currently include these fields (see limitations below), so for now replies and tapbacks from the mesh appear in the app as ordinary text messages.
 - Robustness: a bad WebSocket event is logged instead of dropping the connection, a phone that stops reading is disconnected without stalling other traffic, Meshpoint REST calls time out after 30 seconds, and SIGINT/SIGTERM shut the bridge down cleanly (including mDNS goodbyes) *(not yet live-verified)*.
 
 Items marked *not yet live-verified* were added in a hardening update. They are covered by unit tests of the helper functions where practical, but have not yet been exercised on the RAK Miner V2 installation. See [docs/TESTING.md](docs/TESTING.md) for the pending checklist.
@@ -72,7 +72,7 @@ The following are **not implemented yet**:
 - Persisting favorite/unfavorite actions from the native Meshtastic app to a bridge-local favorites file. The current bridge acknowledges `set_favorite_node` but does not persist it.
 - A systemd service, boot-time enablement, installer, or protected credential-file setup.
 - Increase support for more Meshtastic packet types and administration operations (traceroute, node info exchanges).
-- Sending replies and tapbacks from the phone. They are currently transmitted as plain text messages, because it is not known whether Meshpoint's send API accepts reply/tapback fields.
+- Replies and tapbacks in either direction. A `--probe` capture on November 11, 2026 showed that Meshpoint's WebSocket events do not include the Meshtastic `reply_id` or `emoji` (tapback) fields, so a tapback arrives as a plain text packet containing the emoji. Meshpoint's `POST /api/messages/send` request also has no fields for them, so replies and tapbacks sent from the phone go out as plain text. This needs a change in Meshpoint; an issue is being raised on the Meshpoint repository.
 
 The planned favorite list will be managed by the bridge and will be independent of Meshpoint dashboard favorites. The intended retention rule is: include nodes heard in the previous five days **or** nodes favorited locally through the Meshtastic app.
 
