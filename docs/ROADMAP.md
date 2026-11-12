@@ -17,7 +17,7 @@ Live app testing on the RAK Miner V2 confirmed that hop count and battery percen
 - Isolated per-event error handling on the WebSocket; automatic re-login after session expiry with a 5-minute backoff after a rejected re-login.
 - Per-phone bounded send queues, REST timeouts, and clean SIGINT/SIGTERM shutdown with mDNS goodbyes.
 - MAC-based default node ID (Ethernet, then Wi-Fi), UTC handling of timezone-less timestamps, and 0,0 positions treated as unset.
-- Merge of live NodeInfo/position updates with polled API data by recency, bounded duplicate-packet tracking, and receive-side reply/tapback fields.
+- Merge of live NodeInfo/position updates with polled API data by recency, bounded duplicate-packet tracking, and receive-side reply/tapback fields (dormant until Meshpoint exposes them; see below).
 
 Each of these still needs a pass on the live installation; see the checklist in [TESTING.md](TESTING.md).
 
@@ -54,8 +54,14 @@ Each of these still needs a pass on the live installation; see the checklist in 
   - Truncate the bridge's own long and short names with `trunc_utf8`, as is done for remote nodes.
   - Send module configuration, and answer more `get_*` admin requests with real responses.
   - Trim speculative alternate key names (for example `longName`, `lat`/`lng`) and simplify cookie handling once Meshpoint's API shape is confirmed.
-  - Send replies and tapbacks from the phone if Meshpoint's send API supports them.
   - Decide how to handle the dashboard password on the command line (`--password` is visible in process listings; prefer the environment variable until then).
+
+## Replies and tapbacks
+
+A `--probe` capture on November 11, 2026 showed that Meshpoint does not expose the Meshtastic `reply_id` and `emoji` fields: a tapback arrives as `"packet_type": "text"` with only `{"text": "😂"}` in `decoded_payload`, and the `message_received` event has no such fields either. Meshpoint's `SendRequest` schema accepts only `text`, `destination`, `protocol`, `channel`, `want_ack` and `echo_hash`.
+
+- Raise an issue on the Meshpoint repository asking it to (1) include `reply_id` and `emoji` for text packets in its WebSocket events, and (2) accept them in `POST /api/messages/send`.
+- Once Meshpoint exposes them, confirm the receive-side field names in the bridge and add send-side support for replies and tapbacks from the phone.
 
 ## Follow-up investigation
 
