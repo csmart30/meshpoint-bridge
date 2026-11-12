@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only
 """
 meshpoint_bridge - makes a Meshpoint look like a Meshtastic node (TCP API, port 4403)
 so the Meshtastic phone app can connect to it over Wi-Fi.
@@ -319,7 +320,7 @@ async def try_login(session, base, username, password):
             async with session.post(base + LOGIN_PATH, json={"username": username, "password": password},
                                     timeout=REST_TIMEOUT) as r:
                 text = await r.text()
-                log.debug("login -> %s %s", r.status, text[:120])
+                log.debug("login -> %s", r.status)  # never log the body: it can contain the session token
                 if r.status in (401, 403):
                     return False
                 if r.status == 429:
