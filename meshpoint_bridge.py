@@ -38,7 +38,7 @@ import socket
 import sys
 import tempfile
 import time
-from collections import deque
+from collections import OrderedDict, deque
 from datetime import datetime, timezone
 
 import aiohttp
@@ -65,6 +65,8 @@ CONFIG_KINDS = {0: "device", 1: "position", 2: "power", 3: "network",
                 4: "display", 5: "lora", 6: "bluetooth", 7: "security"}
 MAX_CHANNELS = 8
 REST_TIMEOUT = aiohttp.ClientTimeout(total=30)  # per REST call; the websocket has no such limit
+EARLY_ACK_HOLD = 30   # seconds to keep an ack that arrived before its send request finished
+DM_HISTORY_MAX = 256  # finished DMs remembered, to recognise duplicate and late acks
 RELOGIN_BACKOFF = 300  # seconds to wait after a failed re-login (avoids tripping the dashboard lockout)
 log = logging.getLogger("bridge")
 
@@ -747,6 +749,8 @@ class Bridge:
         self.last_nodeinfo_tx = 0.0
         self.own_pos = None
         self.pending = {}  # Meshpoint packet id -> (phone packet id, destination node) for DMs awaiting a real ack
+        self.early_acks = {}  # Meshpoint packet id -> (source, error, monotonic time): ack seen before the send returned
+        self.dm_history = OrderedDict()  # Meshpoint packet id -> (phone packet id, "done" | "timed_out")
         self.fr_id = random.randint(1, 2**31)
 
     # ---- Meshpoint REST (re-logs in once on a 401)
@@ -1186,11 +1190,15 @@ class Bridge:
                 log.warning("send error: %r", e)
             tracked = False
             if ok and pkt.want_ack and pkt.to != BROADCAST and mp_id is not None:
-                # DM: wait for the recipient's real ack instead of claiming delivery right away
-                self.pending[mp_id] = (pkt.id, pkt.to)
-                task = asyncio.create_task(self.ack_timeout(mp_id))
-                self.tasks.add(task)  # keep a reference so it isn't garbage-collected mid-sleep
-                task.add_done_callback(self.tasks.discard)
+                # DM: wait for the recipient's real ack instead of claiming delivery right away.
+                # A nearby node can answer before Meshpoint's send request returns, so check first
+                # whether its ack is already here.
+                early = self.take_early_ack(mp_id)
+                if early:
+                    self.complete_dm(mp_id, pkt.id, *early)
+                else:
+                    self.pending[mp_id] = (pkt.id, pkt.to)
+                    self.spawn(self.ack_timeout(mp_id))
                 tracked = True
             if pkt.want_ack and not tracked:
                 await self.to_client(c, packet=self.ack_for(pkt, ok))
@@ -1222,7 +1230,28 @@ class Bridge:
         if entry:
             log.info("no confirmation from %s within %ds; app shows 'relayed, not confirmed'",
                      node_id(entry[1]), seconds)
+            self.remember_dm(mp_id, entry[0], "timed_out")
             self.broadcast(packet=self.routing_packet(self.my_num, entry[0]))
+
+    def remember_dm(self, mp_id, phone_id, state):
+        self.dm_history[mp_id] = (phone_id, state)
+        self.dm_history.move_to_end(mp_id)
+        while len(self.dm_history) > DM_HISTORY_MAX:
+            self.dm_history.popitem(last=False)
+
+    def complete_dm(self, mp_id, phone_id, src, err):
+        """Pass the recipient's real confirmation (or failure) for a DM to the app."""
+        log.info("DM %s by %s", "confirmed" if err == 0 else f"failed (error {err})", node_id(src))
+        self.remember_dm(mp_id, phone_id, "done")
+        self.broadcast(packet=self.routing_packet(src, phone_id, err))
+
+    def take_early_ack(self, mp_id):
+        """(source, error) of an ack that arrived before its send request finished, if any."""
+        now = time.monotonic()
+        for k in [k for k, v in self.early_acks.items() if now - v[2] > EARLY_ACK_HOLD]:
+            del self.early_acks[k]
+        early = self.early_acks.pop(mp_id, None)
+        return early[:2] if early else None
 
     async def on_routing_event(self, d, dp):
         """An ack/nak addressed to the Meshpoint: pass the recipient's real confirmation to the app."""
@@ -1239,13 +1268,26 @@ class Bridge:
                 err = mesh_pb2.Routing.Error.Value(str(err).upper())
             except ValueError:
                 err = 0
-        entry = self.pending.pop(req, None) if req is not None else None
-        if not entry:
-            log.info("routing packet from %s not matched to a pending DM: %s", node_id(src), json.dumps(dp)[:200])
+        if req is None:
+            log.debug("routing packet from %s without a request id: %s", node_id(src), json.dumps(dp)[:200])
             return
-        phone_id = entry[0]
-        log.info("DM %s by %s", "confirmed" if err == 0 else f"failed (error {err})", node_id(src))
-        self.broadcast(packet=self.routing_packet(src, phone_id, err))
+        entry = self.pending.pop(req, None)
+        if entry:
+            self.complete_dm(req, entry[0], src, err)
+            return
+        past = self.dm_history.get(req)
+        if past:
+            phone_id, state = past
+            if state == "timed_out":  # the confirmation came after we stopped waiting: still tell the app
+                log.info("late confirmation from %s for a DM that had timed out", node_id(src))
+                self.complete_dm(req, phone_id, src, err)
+            else:
+                log.debug("duplicate routing packet from %s for an already confirmed DM", node_id(src))
+            return
+        # Possibly the ack for a DM whose send request has not returned yet: hold it briefly.
+        self.take_early_ack(-1)  # prunes expired entries
+        self.early_acks[req] = (src, err, time.monotonic())
+        log.debug("routing packet from %s for %08x not matched yet; holding it %ds", node_id(src), req, EARLY_ACK_HOLD)
 
     async def share_nodeinfo(self, c, pkt):
         """The app's 'exchange user info': have the Meshpoint broadcast its own NodeInfo now.
@@ -1342,7 +1384,10 @@ class Bridge:
             h = d.get("channel_hash")
             chan = self.hash_to_idx.get(h)
             if chan is None:
-                log.warning("text on unknown channel_hash %s; known=%s (using channel 0)", h, self.hash_to_idx)
+                if dst == self.my_num and str(h).lower() in ("0", "00", "0x0", "0x00", "none"):
+                    pass  # a public-key encrypted DM carries no channel hash
+                else:
+                    log.warning("text on unknown channel_hash %s; known=%s (using channel 0)", h, self.hash_to_idx)
                 chan = 0
         pkt = mesh_pb2.MeshPacket()
         setattr(pkt, "from", src)

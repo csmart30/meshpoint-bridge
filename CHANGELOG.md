@@ -7,6 +7,9 @@
 - `--setup` now tells you how to apply the new settings for the file you changed: the restart command only when the service is installed, or the `--config` command for a settings file of your own.
 - Messages no longer assume the bridge runs on a Raspberry Pi: the mDNS log lines say "this device's IP", the login hint points to `http://<meshpoint-ip>:8080`, and the installer no longer mentions a Pi.
 - README and `docs/TESTING.md`: recorded the November 13 results, including how the iPhone app shows receive-only mode.
+- A DM recipient's acknowledgement that arrives before Meshpoint answers the send request is no longer lost. Previously the bridge discarded it and, 60 seconds later, told the app "relayed, not confirmed" for a message that had been delivered. Such acks are now held for 30 seconds and applied as soon as the send returns.
+- A confirmation that arrives after the 60-second wait is still passed to the app; a duplicate acknowledgement (the same ack heard twice via a relay) is logged at debug level instead of "not matched".
+- Incoming public-key encrypted DMs, which carry no channel hash, no longer log an "unknown channel_hash" warning.
 
 ### Service, settings and access-control update (not yet live-verified on hardware)
 
