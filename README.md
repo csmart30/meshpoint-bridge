@@ -90,7 +90,7 @@ The following are **not implemented yet**:
 
 The planned favorite list will be managed by the bridge and will be independent of Meshpoint dashboard favorites. The intended retention rule is: include nodes heard in the previous five days **or** nodes favorited locally through the Meshtastic app.
 
-See [docs/ROADMAP.md](docs/ROADMAP.md) for the development plan and [docs/TESTING.md](docs/TESTING.md) for the current hardware test record.
+See [docs/ROADMAP.md](docs/ROADMAP.md) for the development plan, [docs/TESTING.md](docs/TESTING.md) for the current hardware test record, and [docs/API_CONTRACT.md](docs/API_CONTRACT.md) for every Meshpoint API endpoint and field the bridge depends on.
 
 ## Requirements
 

@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Documentation
+
+- Added `docs/API_CONTRACT.md`: every Meshpoint REST endpoint, WebSocket event and field the bridge uses, how it authenticates and handles errors, and the open items on both sides (for KMX415/meshpoint#172).
+
 ### Fixes from live testing (November 13, 2026)
 
 - `--setup` now tells you how to apply the new settings for the file you changed: the restart command only when the service is installed, or the `--config` command for a settings file of your own.
