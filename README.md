@@ -130,7 +130,7 @@ If a bridge you started by hand is still running, the installer offers to stop i
 | Upgrade | `git pull`, then `sudo ./install.sh` again (settings are kept) |
 | Uninstall | `sudo /opt/meshpoint-bridge/install.sh --uninstall` (asks before deleting the settings) |
 
-The service restarts automatically if it fails, waiting longer between attempts (up to 5 minutes) while Meshpoint is unavailable. It does **not** restart after a settings or password error (exit code 78), because retrying a wrong password would count toward the dashboard lockout: fix it with `--setup` and restart the service.
+The service restarts automatically if it fails, waiting longer between attempts (up to 5 minutes) while Meshpoint is unavailable. It does **not** restart after a settings or password error (exit code 78), because retrying a wrong password would count toward the dashboard lockout: fix it with `--setup` and restart the service. Meshpoint locks dashboard logins for 5 minutes after 5 failed attempts; `--setup` stops after 3 wrong passwords, so wait a few minutes before a second attempt.
 
 ### Running by hand (development)
 
