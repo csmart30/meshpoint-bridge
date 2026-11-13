@@ -116,7 +116,7 @@ sudo ./install.sh
 
 1. creates a `meshpoint-bridge` system user (no login shell, no sudo rights);
 2. copies the program to `/opt/meshpoint-bridge` and builds a Python environment there from the pinned `requirements.txt`;
-3. runs `--setup`, which asks for the dashboard username and password (and checks they work), the listen address, the client allowlist, mDNS and receive-only mode, and saves them to `/etc/meshpoint-bridge/bridge.env` (mode 600, readable only by the service user);
+3. runs `--setup`, which asks for the dashboard username and password (and checks they work), shows the Meshpoint node ID the app will see, asks for the listen address, the client allowlist, mDNS and receive-only mode, and saves them to `/etc/meshpoint-bridge/bridge.env` (mode 600, readable only by the service user);
 4. installs, enables and starts `meshpoint-bridge.service`, which starts after Meshpoint at boot.
 
 If a bridge you started by hand is still running, the installer offers to stop it so the service can use port `4403`. An earlier manual install in `/opt/meshpoint-bridge` is upgraded in place: its program files and venv are replaced, other files there are left alone.
@@ -196,7 +196,7 @@ Settings are read from `/etc/meshpoint-bridge/bridge.env` at every start (see [`
 | `BRIDGE_MDNS` | `--no-mdns` | `1` | Advertise via mDNS |
 | `BRIDGE_ADVERTISE_IP` | `--advertise-ip` | automatic | Advertise only this IPv4 address via mDNS |
 | `BRIDGE_RX_ONLY` | `--rx-only` | `0` | Receive-only mode |
-| `BRIDGE_NODE_ID` | `--node-id` | blank | Node ID used only when Meshpoint reports none |
+| `BRIDGE_NODE_ID` | `--node-id` | blank | Node ID used only when Meshpoint reports none (setup asks for it only then) |
 
 Other options: `--config PATH` (another settings file), `--setup`, `--show-config`, `--probe`, `--version`, and `-v` / `--verbose` (debug logging, which includes message text).
 

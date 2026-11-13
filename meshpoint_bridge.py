@@ -1704,22 +1704,42 @@ async def amain(args):
 
 # ----------------------------------------------------------------- setup
 async def check_login(meshpoint, username, password):
-    """Setup helper: True = login works (or none needed), False = rejected, None = could not tell."""
+    """Setup helper. Returns (result, config): result True = login works (or none needed),
+    False = rejected, None = could not tell; config is Meshpoint's /api/config when it could be read."""
     base = f"http://{meshpoint}"
+
+    async def read_config(s):
+        try:
+            async with s.get(f"{base}/api/config", timeout=REST_TIMEOUT) as r:
+                return await r.json(content_type=None) if r.status == 200 else None
+        except (aiohttp.ClientError, asyncio.TimeoutError, OSError, ValueError):
+            return None
+
     async with aiohttp.ClientSession(cookie_jar=aiohttp.CookieJar(unsafe=True),
                                      connector=aiohttp.TCPConnector(force_close=True)) as s:
         try:
             async with s.get(f"{base}/api/config", timeout=REST_TIMEOUT) as r:
                 if r.status != 401:
-                    return True
+                    return True, await read_config(s)
         except (aiohttp.ClientError, asyncio.TimeoutError, OSError):
             print(f"  Could not reach the Meshpoint at {base}. Is the meshpoint service running?")
-            return None
+            return None, None
         try:
-            return await try_login(s, base, username, password)
+            ok = await try_login(s, base, username, password)
         except SystemExit as e:  # lockout, unexpected response, unreachable
             print(f"  {e}")
-            return None
+            return None, None
+        return ok, (await read_config(s) if ok else None)
+
+
+def meshpoint_identity(cfg):
+    """From Meshpoint's /api/config: (node number or None, long name, short name, transmit enabled)."""
+    tx = pick(cfg, "transmit", default={}) if isinstance(cfg, dict) else {}
+    tx = tx if isinstance(tx, dict) else {}
+    num = node_num(pick(tx, "node_id_hex", "node_id"))
+    if num in (0, BROADCAST):
+        num = None
+    return num, pick(tx, "long_name", default=""), pick(tx, "short_name", default=""), tx.get("enabled") is not False
 
 
 def ask(prompt, default="", check=None):
@@ -1766,6 +1786,7 @@ def run_setup(args):
                    current.get("MESHPOINT_USERNAME") or os.environ.get("MESHPOINT_USERNAME") or "admin")
     saved = current.get("MESHPOINT_PASSWORD") or os.environ.get("MESHPOINT_PASSWORD")
     password = None
+    cfg = None
     for attempt in range(3):  # each wrong password counts toward the dashboard lockout, so stop at 3
         pw = getpass.getpass("Meshpoint dashboard password" + (" (Enter keeps the saved one)" if saved else "") + ": ")
         pw = pw or saved
@@ -1775,7 +1796,7 @@ def run_setup(args):
         if "\n" in pw or "\r" in pw:
             print("  The password cannot contain line breaks.")
             continue
-        result = asyncio.run(check_login(args.meshpoint, username, pw))
+        result, cfg = asyncio.run(check_login(args.meshpoint, username, pw))
         if result:
             print("  Login OK.")
             password = pw
@@ -1790,6 +1811,19 @@ def run_setup(args):
     if password is None:
         raise ConfigError("setup stopped: no working dashboard password (nothing was saved)")
 
+    # Show the node identity the app will see. Meshpoint's transmit node ID is always used, so
+    # there is only something to ask when Meshpoint has none (receive-only mode).
+    mp_num, mp_long, mp_short, mp_tx = meshpoint_identity(cfg)
+    if mp_num:
+        names = f" ({mp_long}/{mp_short})" if mp_long or mp_short else ""
+        print(f"  Meshpoint node ID: {node_id(mp_num)}{names}, transmit {'enabled' if mp_tx else 'disabled'}.")
+        print("  The Meshtastic app will see this node ID.")
+        if not mp_tx:
+            print("  Transmit is disabled on the Meshpoint, so the bridge will run receive-only.")
+    elif cfg is not None:
+        print("  Meshpoint has no transmit node ID, so the bridge will run receive-only.")
+    print()
+
     def check_host(v):
         ipaddress.ip_address(v)
 
@@ -1803,10 +1837,31 @@ def run_setup(args):
                 current.get("BRIDGE_ALLOW", ""), parse_allowlist)
     mdns = ask_yes_no("Advertise the bridge via mDNS so the app finds it automatically?",
                       parse_bool(current.get("BRIDGE_MDNS") or "1", "BRIDGE_MDNS"))
-    rx_only = ask_yes_no("Receive-only (never transmit; sends from the app are rejected)?",
-                         parse_bool(current.get("BRIDGE_RX_ONLY") or "0", "BRIDGE_RX_ONLY"))
-    node = ask("Node id to use only if Meshpoint has none, e.g. !a1b2c3d4 (blank = this device's MAC)",
-               current.get("BRIDGE_NODE_ID", ""), check_node)
+    saved_rx_only = parse_bool(current.get("BRIDGE_RX_ONLY") or "0", "BRIDGE_RX_ONLY")
+    if (mp_num and mp_tx) or cfg is None:  # only a choice when Meshpoint can transmit (or we could not tell)
+        rx_only = ask_yes_no("Receive-only (never transmit; sends from the app are rejected)?", saved_rx_only)
+    else:
+        rx_only = saved_rx_only  # receive-only anyway: Meshpoint cannot transmit
+
+    if mp_num:
+        node = ""  # never used while Meshpoint has a node ID
+        if current.get("BRIDGE_NODE_ID"):
+            print(f"  Cleared BRIDGE_NODE_ID ({current['BRIDGE_NODE_ID']}): the Meshpoint node ID is always used.")
+    else:
+        mac = mac_node_num()
+        if cfg is None:
+            print("  Could not read the Meshpoint node ID. If Meshpoint has one, it will be used;")
+            print("  the node ID below is only used if it has none.")
+        if mac:
+            hint = f"blank = {node_id(mac)}, from this device's MAC address"
+        else:
+            hint = "required: this device has no usable MAC address"
+
+        def check_needed(v):
+            check_node(v)
+            if not v and not mac:
+                raise ValueError("enter a node ID like !a1b2c3d4; without one the bridge cannot start")
+        node = ask(f"Node ID for the app to use ({hint})", current.get("BRIDGE_NODE_ID", ""), check_needed)
 
     values = dict(current)
     values.update({
