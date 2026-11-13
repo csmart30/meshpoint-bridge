@@ -15,6 +15,7 @@
 - A DM recipient's acknowledgement that arrives before Meshpoint answers the send request is no longer lost. Previously the bridge discarded it and, 60 seconds later, told the app "relayed, not confirmed" for a message that had been delivered. Such acks are now held for 30 seconds and applied as soon as the send returns.
 - A confirmation that arrives after the 60-second wait is still passed to the app; a duplicate acknowledgement (the same ack heard twice via a relay) is logged at debug level instead of "not matched".
 - Incoming public-key encrypted DMs, which carry no channel hash, no longer log an "unknown channel_hash" warning.
+- `--setup` now shows the Meshpoint node ID the app will see (with its names and whether transmit is enabled) right after the login check, instead of asking for a node ID. It asks for one only when Meshpoint has no transmit node ID, offering this device's MAC-based ID as the default, and clears a leftover `BRIDGE_NODE_ID` that would be ignored. The receive-only question is skipped when Meshpoint cannot transmit anyway.
 
 ### Service, settings and access-control update (not yet live-verified on hardware)
 
