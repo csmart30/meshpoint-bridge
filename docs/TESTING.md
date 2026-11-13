@@ -54,7 +54,6 @@ The client-base node advertises Meshpoint as one of its direct neighbors, while 
 
 The following behavior was added after the November 10, 2026 session and has **not** been tested on hardware. The standard-library unit tests cover the pure helper functions (position validation, timestamp parsing, MAC-based node ID selection, duplicate tracking, schema resolution). Everything below needs a live pass; record the date, Meshpoint version, and result next to each item when done.
 
-- [ ] **Stable node ID:** restart the bridge without `--node-id` and confirm the node ID in the app stays the same and matches the last four bytes of the expected MAC address (Ethernet if present, otherwise Wi-Fi). Expect the ID to change once compared with the earlier random ID.
 - [ ] **Session expiry:** invalidate the dashboard session (or wait for it to expire), then send a message from the app. Expect an "logging in again" log line and a successful send. Also confirm that a wrong stored password produces one failed login and then a 5-minute pause, not repeated attempts.
 - [ ] **0,0 positions:** with a node reporting latitude/longitude of exactly 0,0, confirm the app shows no map position for it.
 - [ ] **Stalled phone:** disable the phone's Wi-Fi or suspend the app mid-session, and confirm other traffic is not delayed and the dead connection is dropped.
@@ -63,3 +62,20 @@ The following behavior was added after the November 10, 2026 session and has **n
 - [ ] **Shutdown:** stop the bridge with Ctrl-C and with `kill -TERM`; confirm the "shutting down" log line, that the mDNS entry disappears from the phone's list, and that the listening port is released.
 - [ ] **Timestamps:** confirm `last_heard` times in the app match Meshpoint's dashboard, in particular for any timestamps Meshpoint reports without a timezone.
 - [ ] **Regression:** repeat the earlier broadcast, direct-message, acknowledgement, and metadata checks to confirm nothing changed.
+
+## Pending verification: service, settings and access-control update
+
+Added after the hardening update; not yet tested on hardware. Unit tests cover the settings file, setting precedence, the allowlist, node-ID selection, receive-only rejection and log privacy. Record the date, Meshpoint version and result next to each item.
+
+- [ ] **Install:** `sudo ./install.sh` on the RAK Miner V2 creates the `meshpoint-bridge` user, `/opt/meshpoint-bridge/venv`, `/etc/meshpoint-bridge/bridge.env` (mode 600, owned by `meshpoint-bridge`) and a running service. The app connects as before.
+- [ ] **Upgrade from the manual install:** with the earlier hand-started bridge running from `/opt/meshpoint-bridge`, the installer offers to stop it and the service takes over port 4403.
+- [ ] **Boot:** after a reboot the service starts after Meshpoint and the app can connect without any manual step.
+- [ ] **Wrong password:** set a wrong password with `--setup`; the service fails once with exit code 78 and is **not** restarted (one failed dashboard login, no lockout).
+- [ ] **Meshpoint down:** stop `meshpoint`; the bridge exits and the service retries with growing delays, then recovers when Meshpoint starts again.
+- [ ] **Node ID:** the app shows Meshpoint's transmit node ID (dashboard / `/api/config` `transmit.node_id_hex`). Setting a different `BRIDGE_NODE_ID` logs an error and does not change it.
+- [ ] **Identity change:** change `transmit.node_id` in Meshpoint and restart Meshpoint; the bridge logs "Meshpoint identity changed" and the service restarts it with the new ID.
+- [ ] **Receive-only:** with `BRIDGE_RX_ONLY=1` (and separately with transmit disabled on the Meshpoint), the app shows transmit disabled, received messages still appear, and a message sent from the app fails immediately and is not transmitted.
+- [ ] **Allowlist:** with `BRIDGE_ALLOW` set to the phone's network, the phone connects; a device outside it is refused (log line) and does not disconnect the phone.
+- [ ] **Listen address / mDNS:** with `BRIDGE_LISTEN_HOST` set to the Meshpoint's LAN IP, the app connects on that address only; with `BRIDGE_MDNS=0`, the bridge no longer appears in the app's discovered list.
+- [ ] **Log privacy:** without `-v`, sent and received messages appear in `journalctl -u meshpoint-bridge` as metadata only, with no message text.
+- [ ] **Uninstall:** `sudo /opt/meshpoint-bridge/install.sh --uninstall` removes the service and program files and asks before deleting the settings.

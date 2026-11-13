@@ -1,0 +1,45 @@
+# meshpoint-bridge: Meshtastic TCP API for the Meshtastic app, backed by the local Meshpoint.
+# Installed by install.sh to /etc/systemd/system/meshpoint-bridge.service.
+[Unit]
+Description=Meshpoint Bridge (Meshtastic TCP API on port 4403)
+Documentation=https://github.com/csmart30/meshpoint-bridge
+Wants=network-online.target meshpoint.service
+After=network-online.target meshpoint.service
+# Keep retrying while Meshpoint starts up (e.g. after a reboot); the delay grows up to 5 minutes.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=meshpoint-bridge
+Group=meshpoint-bridge
+ExecStart=/opt/meshpoint-bridge/venv/bin/python /opt/meshpoint-bridge/meshpoint_bridge.py --config /etc/meshpoint-bridge/bridge.env
+Environment=PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
+Restart=on-failure
+RestartSec=10
+RestartSteps=5
+RestartMaxDelaySec=300
+# 78 = settings or password problem: retrying would only count toward the dashboard lockout.
+# Fix it with --setup, then: sudo systemctl restart meshpoint-bridge
+RestartPreventExitStatus=78
+
+# Hardening: the bridge only needs the network and read access to its settings file.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

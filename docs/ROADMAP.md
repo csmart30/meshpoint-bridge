@@ -16,7 +16,7 @@ Live app testing on the RAK Miner V2 confirmed that hop count and battery percen
 
 - Isolated per-event error handling on the WebSocket; automatic re-login after session expiry with a 5-minute backoff after a rejected re-login.
 - Per-phone bounded send queues, REST timeouts, and clean SIGINT/SIGTERM shutdown with mDNS goodbyes.
-- MAC-based default node ID (Ethernet, then Wi-Fi), UTC handling of timezone-less timestamps, and 0,0 positions treated as unset.
+- MAC-based default node ID (Ethernet, then Wi-Fi), UTC handling of timezone-less timestamps, and 0,0 positions treated as unset. (The node ID now always comes from Meshpoint; the MAC is only used in receive-only mode.)
 - Merge of live NodeInfo/position updates with polled API data by recency, bounded duplicate-packet tracking, and receive-side reply/tapback fields (dormant until Meshpoint exposes them; see below).
 
 Each of these still needs a pass on the live installation; see the checklist in [TESTING.md](TESTING.md).
@@ -32,11 +32,17 @@ Each of these still needs a pass on the live installation; see the checklist in 
 
 ## Service and installation
 
-1. Add a systemd unit that runs under a dedicated, unprivileged service account.
-2. Add an installer/setup helper to create the service account, state directory, Python virtual environment, and unit.
-3. Store credentials outside the repository in a root-readable environment file with restrictive permissions.
-4. Avoid repeated login attempts and restart loops when credentials are rejected, to reduce the risk of triggering Meshpoint's login lockout. Partly done: a rejected re-login while running now backs off for 5 minutes. Rejected credentials at startup still exit immediately, so the service unit must not restart in a tight loop.
-5. Support boot startup, journal logging, and straightforward upgrades with `git pull` plus service restart. (Clean shutdown on SIGTERM is already handled by the script.)
+Implemented (pending live verification, see [TESTING.md](TESTING.md)):
+
+1. A systemd unit that runs under a dedicated, unprivileged `meshpoint-bridge` account, with sandboxing.
+2. `install.sh` to create the account, Python virtual environment and unit, upgrade in place, and uninstall.
+3. Credentials stored outside the repository in `/etc/meshpoint-bridge/bridge.env` (mode 600), written by `--setup`.
+4. No restart loop on rejected credentials or bad settings: those exit with code 78, which the unit does not restart. A rejected re-login while running backs off for 5 minutes.
+5. Boot startup after `meshpoint.service`, journal logging, and upgrades with `git pull` plus `sudo ./install.sh`.
+
+Still open:
+
+- Optional encrypted storage of the dashboard password (systemd credentials), or a scoped Meshpoint API token instead of the admin password, if Meshpoint adds one.
 
 ## Later improvements
 

@@ -1,3 +1,5 @@
-meshtastic
-aiohttp
-zeroconf
+# Versions tested on the Meshpoint (Debian 13.6, Python 3.13.5). Change only after re-testing.
+meshtastic==2.7.11
+protobuf==7.36.2
+aiohttp==3.14.5
+zeroconf==0.154.0
