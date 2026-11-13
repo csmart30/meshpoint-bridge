@@ -16,15 +16,17 @@ sent direct messages with recipient acknowledgements. See docs/TESTING.md.
 This is an early community bridge, not a complete Meshtastic device implementation.
 Only the packet types and admin requests documented in README.md are currently handled.
 
-Setup:  pip install -r requirements.txt
-Probe:  python3 meshpoint_bridge.py --probe
-Run:    python3 meshpoint_bridge.py
-Phone:  Meshtastic app > + > Network > (auto-discovered, or enter the bridge host IP)
+Install as a service:  sudo ./install.sh        (creates the settings file and starts the service)
+Change settings:       sudo /opt/meshpoint-bridge/venv/bin/python /opt/meshpoint-bridge/meshpoint_bridge.py --setup
+Show settings:         ... meshpoint_bridge.py --show-config
+Probe:                 python3 meshpoint_bridge.py --probe
+Phone:                 Meshtastic app > + > Network > (auto-discovered, or enter the Meshpoint's IP)
 """
 import argparse
 import asyncio
 import base64
 import getpass
+import ipaddress
 import json
 import logging
 import math
@@ -34,8 +36,9 @@ import re
 import signal
 import socket
 import sys
+import tempfile
 import time
-from collections import deque
+from collections import OrderedDict, deque
 from datetime import datetime, timezone
 
 import aiohttp
@@ -43,6 +46,16 @@ from google.protobuf.message import DecodeError
 from meshtastic.protobuf import (
     admin_pb2, channel_pb2, config_pb2, mesh_pb2, portnums_pb2, telemetry_pb2,
 )
+
+__version__ = "0.1.0"
+
+DEFAULT_CONFIG = "/etc/meshpoint-bridge/bridge.env"
+SERVICE_USER = "meshpoint-bridge"
+SERVICE_UNIT = "/etc/systemd/system/meshpoint-bridge.service"
+# Exit codes (the systemd unit restarts on failure, except for EXIT_CONFIG: retrying a bad
+# setting or a wrong password every few seconds would only trip the dashboard lockout).
+EXIT_CONFIG = 78   # EX_CONFIG: fix the settings, then start again
+EXIT_RESTART = 75  # EX_TEMPFAIL: Meshpoint's identity changed; restart to pick it up
 
 START1, START2 = 0x94, 0xC3
 BROADCAST = 0xFFFFFFFF
@@ -52,6 +65,8 @@ CONFIG_KINDS = {0: "device", 1: "position", 2: "power", 3: "network",
                 4: "display", 5: "lora", 6: "bluetooth", 7: "security"}
 MAX_CHANNELS = 8
 REST_TIMEOUT = aiohttp.ClientTimeout(total=30)  # per REST call; the websocket has no such limit
+EARLY_ACK_HOLD = 30   # seconds to keep an ack that arrived before its send request finished
+DM_HISTORY_MAX = 256  # finished DMs remembered, to recognise duplicate and late acks
 RELOGIN_BACKOFF = 300  # seconds to wait after a failed re-login (avoids tripping the dashboard lockout)
 log = logging.getLogger("bridge")
 
@@ -293,6 +308,270 @@ def resolve_schema(spec, sch, depth=6):
     return {k: resolve_schema(spec, v, depth - 1) for k, v in sch.items()}
 
 
+# ----------------------------------------------------------------- settings
+class ConfigError(SystemExit):
+    """A settings or credential problem that restarting will not fix. Exits with EXIT_CONFIG,
+    which the systemd unit does not restart (so a wrong password is not retried in a loop)."""
+
+    def __init__(self, message):
+        super().__init__(EXIT_CONFIG)
+        self.message = message
+
+    def __str__(self):
+        return self.message
+
+
+# (attribute, settings-file / environment key, default, kind, description)
+SETTINGS = (
+    ("username", "MESHPOINT_USERNAME", "admin", "str", "Meshpoint dashboard username"),
+    ("password", "MESHPOINT_PASSWORD", None, "secret", "Meshpoint dashboard password (this file must stay chmod 600)"),
+    ("listen_host", "BRIDGE_LISTEN_HOST", "0.0.0.0", "str",
+     "Address the Meshtastic TCP API listens on (0.0.0.0 = all interfaces)"),
+    ("listen_port", "BRIDGE_LISTEN_PORT", 4403, "int", "Meshtastic TCP API port"),
+    ("allow", "BRIDGE_ALLOW", "", "str",
+     "Comma-separated IPs/networks allowed to connect, e.g. 192.168.1.0/24 (blank = anyone)"),
+    ("mdns", "BRIDGE_MDNS", True, "bool", "Advertise the bridge to phones via mDNS (1/0)"),
+    ("advertise_ip", "BRIDGE_ADVERTISE_IP", None, "str", "Advertise only this IPv4 address via mDNS (blank = automatic)"),
+    ("rx_only", "BRIDGE_RX_ONLY", False, "bool",
+     "Receive-only: never transmit, reject sends from the app (1/0)"),
+    ("node_id", "BRIDGE_NODE_ID", None, "str",
+     "Node id to use only when Meshpoint reports none, e.g. !a1b2c3d4 (blank = MAC address)"),
+)
+TRUE_WORDS, FALSE_WORDS = ("1", "true", "yes", "on"), ("0", "false", "no", "off")
+
+
+def parse_bool(value, key):
+    if isinstance(value, bool):
+        return value
+    v = str(value).strip().lower()
+    if v in TRUE_WORDS:
+        return True
+    if v in FALSE_WORDS:
+        return False
+    raise ConfigError(f"{key}: expected 1 or 0 (or yes/no), got {value!r}")
+
+
+def unquote_env(value):
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        inner = value[1:-1]
+        return re.sub(r"\\(.)", r"\1", inner) if value[0] == '"' else inner
+    return value
+
+
+def quote_env(value):
+    value = "" if value is None else str(value)
+    if "\n" in value or "\r" in value:
+        raise ValueError("settings values cannot contain line breaks")
+    if value == "" or re.fullmatch(r"[A-Za-z0-9_./:,@!%+=-]+", value):
+        return value
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def read_env_file(path):
+    """Read a KEY=VALUE settings file. Blank lines and lines starting with # are ignored;
+    values may be wrapped in single or double quotes."""
+    values = {}
+    with open(path, encoding="utf-8") as f:
+        for n, raw in enumerate(f, 1):
+            line = raw.strip()
+            if not line or line.startswith(("#", ";")):
+                continue
+            if line.startswith("export "):
+                line = line[7:].lstrip()
+            key, sep, value = line.partition("=")
+            key = key.strip()
+            if not sep or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
+                raise ConfigError(f"{path}, line {n}: expected KEY=VALUE")
+            values[key] = unquote_env(value.strip())
+    return values
+
+
+ENV_HEADER = """\
+# meshpoint-bridge settings. Read at every start; change with
+#   sudo /opt/meshpoint-bridge/venv/bin/python /opt/meshpoint-bridge/meshpoint_bridge.py --setup
+# or edit by hand, then: sudo systemctl restart meshpoint-bridge
+# Contains the dashboard password: keep it chmod 600, owned by the meshpoint-bridge user.
+"""
+
+
+def write_env_file(path, values):
+    """Write the settings file atomically with mode 600, keeping the owner of an existing file
+    (or, when run as root, giving a new file to the service user)."""
+    directory = os.path.dirname(os.path.abspath(path))
+    os.makedirs(directory, mode=0o750, exist_ok=True)
+    owner = None
+    try:
+        st = os.stat(path)
+        owner = (st.st_uid, st.st_gid)
+    except FileNotFoundError:
+        if os.geteuid() == 0:
+            try:
+                import pwd
+                pw = pwd.getpwnam(SERVICE_USER)
+                owner = (pw.pw_uid, pw.pw_gid)
+            except KeyError:
+                pass
+    known = {key: desc for _, key, _, _, desc in SETTINGS}
+    lines = [ENV_HEADER]
+    for key, desc in known.items():
+        if key in values:
+            lines.append(f"# {desc}\n{key}={quote_env(values[key])}\n")
+    extra = [k for k in values if k not in known]
+    if extra:
+        lines.append("# Other settings\n" + "".join(f"{k}={quote_env(values[k])}\n" for k in extra))
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".bridge-env-")
+    try:
+        os.fchmod(fd, 0o600)
+        if owner and os.geteuid() == 0:
+            os.fchown(fd, *owner)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines))
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def resolve_settings(args, file_values, environ, file_label="settings file"):
+    """Fill in each setting: command-line option, then environment variable, then the settings
+    file, then the built-in default. Records where each value came from in args.setting_sources."""
+    sources = {}
+    for attr, key, default, kind, _ in SETTINGS:
+        value = getattr(args, attr, None)
+        source = "command line"
+        if value is None:
+            if environ.get(key) not in (None, ""):
+                value, source = environ[key], "environment"
+            elif file_values.get(key) not in (None, ""):
+                value, source = file_values[key], file_label
+            else:
+                value, source = default, "default"
+        if isinstance(value, str):
+            if kind == "int":
+                try:
+                    value = int(value)
+                except ValueError:
+                    raise ConfigError(f"{key}: expected a number, got {value!r}")
+            elif kind == "bool":
+                value = parse_bool(value, key)
+        setattr(args, attr, value)
+        sources[attr] = source
+    args.setting_sources = sources
+    return args
+
+
+def parse_allowlist(text):
+    """'192.168.1.0/24, 10.0.0.5' -> list of ip_network. Blank means no restriction."""
+    nets = []
+    for part in re.split(r"[,\s]+", text or ""):
+        if not part:
+            continue
+        try:
+            nets.append(ipaddress.ip_network(part, strict=False))
+        except ValueError:
+            raise ConfigError(f"BRIDGE_ALLOW: {part!r} is not an IP address or network (e.g. 192.168.1.0/24)")
+    return nets
+
+
+def ip_allowed(ip, nets):
+    """True if `ip` may connect. An empty list allows everyone (like a stock Meshtastic node)."""
+    if not nets:
+        return True
+    try:
+        addr = ipaddress.ip_address(str(ip).split("%")[0])
+    except ValueError:
+        return False
+    mapped = getattr(addr, "ipv4_mapped", None)  # ::ffff:192.168.1.5 from a dual-stack socket
+    if mapped is not None:
+        addr = mapped
+    return any(addr.version == n.version and addr in n for n in nets)
+
+
+def load_settings(args, environ=None):
+    """Apply the settings file (--config, or DEFAULT_CONFIG if it exists) and validate everything."""
+    environ = os.environ if environ is None else environ
+    path = getattr(args, "config", None) or DEFAULT_CONFIG
+    file_values = {}
+    args.config_path = None
+    if os.path.exists(path):
+        try:
+            file_values = read_env_file(path)
+            args.config_path = path
+        except PermissionError:
+            if getattr(args, "config", None):
+                raise ConfigError(f"cannot read {path}: permission denied")
+            log.warning("cannot read %s (permission denied): using command-line options and environment only. "
+                        "To use it from a shell, run as the service user: sudo -u %s ...", path, SERVICE_USER)
+    elif getattr(args, "config", None):
+        raise ConfigError(f"settings file {path} not found (create it with --setup)")
+    resolve_settings(args, file_values, environ, file_label=path)
+    args.allow_nets = parse_allowlist(args.allow)
+    try:
+        ipaddress.ip_address(args.listen_host)
+    except ValueError:
+        raise ConfigError(f"BRIDGE_LISTEN_HOST: {args.listen_host!r} is not an IP address")
+    if args.advertise_ip:
+        try:
+            ipaddress.IPv4Address(args.advertise_ip)
+        except ValueError:
+            raise ConfigError(f"BRIDGE_ADVERTISE_IP: {args.advertise_ip!r} is not an IPv4 address")
+    if args.node_id and node_num(args.node_id) in (None, 0, BROADCAST):
+        raise ConfigError(f"BRIDGE_NODE_ID: {args.node_id!r} is not a node id (expected e.g. !a1b2c3d4)")
+    if not 0 < args.listen_port < 65536:
+        raise ConfigError(f"BRIDGE_LISTEN_PORT: {args.listen_port} is out of range")
+    return args
+
+
+def format_settings(args):
+    """Human-readable effective settings for --show-config (password masked)."""
+    src = getattr(args, "setting_sources", {})
+    out = [f"meshpoint-bridge {__version__}",
+           f"settings file: {args.config_path or '(none)'}",
+           f"Meshpoint API: http://{args.meshpoint}"]
+    for attr, key, _, kind, _ in SETTINGS:
+        v = getattr(args, attr, None)
+        if kind == "secret":
+            shown = "(set)" if v else "(not set)"
+        elif kind == "bool":
+            shown = "1" if v else "0"
+        else:
+            shown = "" if v is None else str(v)
+        out.append(f"{key:<20} = {shown:<24} [{src.get(attr, '?')}]")
+    return "\n".join(out)
+
+
+def resolve_identity(tx, configured_id=None, force_rx_only=False, mac_fn=mac_node_num):
+    """Pick the node number the app sees. Returns (num, rx_only, source).
+
+    Meshpoint's transmit identity always wins: packets go out on air from that id, so showing the
+    app a different one would make DMs to this node look like they are for someone else.
+    Without a Meshpoint transmit identity (or with transmit off) the bridge is receive-only and
+    uses BRIDGE_NODE_ID, else this machine's MAC address. There is deliberately no random fallback."""
+    tx = tx if isinstance(tx, dict) else {}
+    mp = node_num(pick(tx, "node_id_hex", "node_id"))
+    if mp in (0, BROADCAST):
+        mp = None
+    configured = node_num(configured_id) if configured_id else None
+    rx_only = bool(force_rx_only) or mp is None or tx.get("enabled") is False
+    if mp is not None:
+        if configured and configured != mp:
+            log.error("BRIDGE_NODE_ID %s does not match Meshpoint's node id %s: ignoring it and using %s",
+                      node_id(configured), node_id(mp), node_id(mp))
+        return mp, rx_only, "Meshpoint"
+    if configured:
+        return configured, True, "BRIDGE_NODE_ID"
+    mac = mac_fn()
+    if mac:
+        return mac, True, "MAC address"
+    raise ConfigError("Meshpoint reports no node id and this machine has no usable MAC address. "
+                      "Set BRIDGE_NODE_ID in the settings file, or enable transmit on the Meshpoint.")
+
+
 # ----------------------------------------------------------------- TX body
 def build_tx_body(text, dest, channel, want_ack=False):
     """Body for POST /api/messages/send (SendRequest in Meshpoint's OpenAPI schema).
@@ -327,8 +606,8 @@ async def try_login(session, base, username, password):
                     raise SystemExit("Meshpoint says too many failed logins (locked out). "
                                      "Wait a few minutes, then try again.")
                 if r.status >= 300:
-                    raise SystemExit(f"Unexpected login response ({r.status}) from {base}{LOGIN_PATH}. "
-                                     "This Meshpoint version may use a different login API.")
+                    raise ConfigError(f"Unexpected login response ({r.status}) from {base}{LOGIN_PATH}. "
+                                      "This Meshpoint version may use a different login API.")
                 try:
                     data = json.loads(text)
                 except ValueError:
@@ -353,7 +632,7 @@ async def try_login(session, base, username, password):
 
 
 VERIFY_MSG = ("Login failed. Please verify the username and password you use to log in to your "
-              "local Meshpoint dashboard (http://<pi-ip>:8080) and try again.")
+              "local Meshpoint dashboard (http://<meshpoint-ip>:8080) and try again.")
 
 
 async def ensure_login(session, base, args):
@@ -370,10 +649,10 @@ async def ensure_login(session, base, args):
     if args.password:
         if await try_login(session, base, user, args.password):
             return user, args.password
-        raise SystemExit(VERIFY_MSG)
+        raise ConfigError(VERIFY_MSG)
     if not sys.stdin.isatty():
-        raise SystemExit("Meshpoint requires a login. Set MESHPOINT_PASSWORD (and MESHPOINT_USERNAME "
-                         "if it is not 'admin') or run interactively.")
+        raise ConfigError("Meshpoint requires a login. Set MESHPOINT_PASSWORD (and MESHPOINT_USERNAME "
+                          "if it is not 'admin') in the settings file (run --setup), or run interactively.")
     for attempt in (1, 2):
         pw = getpass.getpass(f"Enter dashboard password for user '{user}': ")
         if await try_login(session, base, user, pw):
@@ -383,7 +662,7 @@ async def ensure_login(session, base, args):
     pw = getpass.getpass(f"Enter dashboard password for user '{user}': ")
     if await try_login(session, base, user, pw):
         return user, pw
-    raise SystemExit(VERIFY_MSG)
+    raise ConfigError(VERIFY_MSG)
 
 
 # ----------------------------------------------------------------- client
@@ -454,7 +733,12 @@ class Bridge:
         self.nodes = {}
         self.node_sig = {}
         self.env_sig = {}
-        self.my_num = node_num(args.node_id) or 0
+        self.my_num = 0            # set from Meshpoint's config in load_config (see resolve_identity)
+        self.rx_only = False       # receive-only: nothing from the app is transmitted
+        self.identity_source = None
+        self.exit_code = 0         # returned by amain(); non-zero makes systemd restart the bridge
+        self.main_task = None
+        self.ws_connects = 0
         self.long_name, self.short_name = "Meshpoint", "MPNT"
         self.region, self.preset = "US", "LONG_FAST"
         self.hop_limit = 3
@@ -465,6 +749,8 @@ class Bridge:
         self.last_nodeinfo_tx = 0.0
         self.own_pos = None
         self.pending = {}  # Meshpoint packet id -> (phone packet id, destination node) for DMs awaiting a real ack
+        self.early_acks = {}  # Meshpoint packet id -> (source, error, monotonic time): ack seen before the send returned
+        self.dm_history = OrderedDict()  # Meshpoint packet id -> (phone packet id, "done" | "timed_out")
         self.fr_id = random.randint(1, 2**31)
 
     # ---- Meshpoint REST (re-logs in once on a 401)
@@ -503,21 +789,61 @@ class Bridge:
                 ok = False
             if ok:
                 self.login_gen += 1
+                self.spawn(self.check_identity())
             else:
                 log.warning("re-login failed; not retrying for %ds", RELOGIN_BACKOFF)
                 self.next_relogin = time.monotonic() + RELOGIN_BACKOFF
             return ok
 
+    def spawn(self, coro):
+        """Run a fire-and-forget task, keeping a reference so it is not garbage-collected early."""
+        task = asyncio.create_task(coro)
+        self.tasks.add(task)
+        task.add_done_callback(self.tasks.discard)
+        return task
+
+    def request_exit(self, code):
+        """Stop the bridge with an exit code (systemd restarts it on a non-zero code)."""
+        self.exit_code = code
+        if self.main_task is not None:
+            self.main_task.cancel()
+
+    async def check_identity(self):
+        """After a re-login or WebSocket reconnect (e.g. Meshpoint restarted), make sure Meshpoint's
+        identity still matches the one the app was given. If it changed, exit so the service restarts
+        and the app reconnects to a node with the right id and transmit state."""
+        try:
+            cfg = await self.get_json("/api/config")
+            num, rx_only, _ = resolve_identity(pick(cfg, "transmit", default={}),
+                                               getattr(self.args, "node_id", None),
+                                               getattr(self.args, "rx_only", False))
+        except ConfigError as e:
+            log.error("%s", e)
+            num, rx_only = None, True
+        except Exception as e:  # noqa
+            log.debug("identity check skipped: %r", e)
+            return
+        if num != self.my_num or rx_only != self.rx_only:
+            log.error("Meshpoint identity changed (%s%s -> %s%s); restarting",
+                      node_id(self.my_num), " RX-only" if self.rx_only else "",
+                      node_id(num) if num else "none", " RX-only" if rx_only else "")
+            self.request_exit(EXIT_RESTART)
+
     # ---- Meshpoint config
     async def load_config(self):
         cfg = await self.get_json("/api/config")
         tx = pick(cfg, "transmit", default={})
-        if not self.my_num:
-            self.my_num = node_num(pick(tx, "node_id_hex", "node_id")) or mac_node_num()
-            if not self.my_num:
-                self.my_num = random.randint(4, 0xFFFFFFFE)
-                log.warning("no node id in config and no usable MAC address: using random id %s "
-                            "(it will change on restart; pass --node-id to pin it)", node_id(self.my_num))
+        self.my_num, self.rx_only, self.identity_source = resolve_identity(
+            tx, getattr(self.args, "node_id", None), getattr(self.args, "rx_only", False))
+        if self.rx_only:
+            if getattr(self.args, "rx_only", False):
+                why = "BRIDGE_RX_ONLY is set"
+            elif tx.get("enabled") is False:
+                why = "transmit is disabled on the Meshpoint"
+            else:
+                why = "Meshpoint reports no transmit node id"
+            log.warning("RX-only mode (%s): mesh traffic is forwarded to the app, but nothing is transmitted "
+                        "and sends from the app are rejected", why)
         self.long_name = pick(tx, "long_name", default=self.long_name)
         self.short_name = pick(tx, "short_name", default=self.short_name)
         self.hop_limit = int(pick(tx, "hop_limit", default=3))
@@ -548,8 +874,8 @@ class Bridge:
             slots = {0: ("", b"\x01", True, channel_hash(default_name, b"\x01"))}
         self.slots = slots
         self.hash_to_idx = {hv: i for i, (_, _, en, hv) in sorted(slots.items()) if en}
-        log.info("Identity %s (%s/%s) region=%s preset=%s hop_limit=%d",
-                 node_id(self.my_num), self.long_name, self.short_name, self.region, self.preset, self.hop_limit)
+        log.info("Identity %s from %s (%s/%s) region=%s preset=%s hop_limit=%d",
+                 node_id(self.my_num), self.identity_source, self.long_name, self.short_name, self.region, self.preset, self.hop_limit)
         log.info("Channels: %s%s", [(i, n or default_name, "0x%02X" % hv, "on" if en else "off")
                                     for i, (n, _, en, hv) in sorted(slots.items())],
                  "" if chans else "   <-- no channel list found in /api/config")
@@ -728,7 +1054,7 @@ class Bridge:
         elif kind == "lora":
             L = config_pb2.Config.LoRaConfig
             sub.use_preset = True
-            sub.tx_enabled = True
+            sub.tx_enabled = not self.rx_only
             sub.hop_limit = self.hop_limit
             try:
                 sub.region = L.RegionCode.Value(self.region)
@@ -840,6 +1166,11 @@ class Bridge:
         except Exception as e:  # noqa
             log.debug("queue status failed: %s", e)
         port = pkt.decoded.portnum
+        if self.rx_only and port != portnums_pb2.ADMIN_APP:  # admin requests are answered locally
+            name = portnums_pb2.PortNum.Name(port) if port in portnums_pb2.PortNum.values() else str(port)
+            log.info("RX-only: %s from the app NOT sent (receive-only mode never transmits)", name)
+            await self.to_client(c, packet=self.ack_for(pkt, ok=False))
+            return
         if port == portnums_pb2.TEXT_MESSAGE_APP:
             text = pkt.decoded.payload.decode("utf-8", "replace")
             ok, mp_id = False, None
@@ -859,17 +1190,22 @@ class Bridge:
                 log.warning("send error: %r", e)
             tracked = False
             if ok and pkt.want_ack and pkt.to != BROADCAST and mp_id is not None:
-                # DM: wait for the recipient's real ack instead of claiming delivery right away
-                self.pending[mp_id] = (pkt.id, pkt.to)
-                task = asyncio.create_task(self.ack_timeout(mp_id))
-                self.tasks.add(task)  # keep a reference so it isn't garbage-collected mid-sleep
-                task.add_done_callback(self.tasks.discard)
+                # DM: wait for the recipient's real ack instead of claiming delivery right away.
+                # A nearby node can answer before Meshpoint's send request returns, so check first
+                # whether its ack is already here.
+                early = self.take_early_ack(mp_id)
+                if early:
+                    self.complete_dm(mp_id, pkt.id, *early)
+                else:
+                    self.pending[mp_id] = (pkt.id, pkt.to)
+                    self.spawn(self.ack_timeout(mp_id))
                 tracked = True
             if pkt.want_ack and not tracked:
                 await self.to_client(c, packet=self.ack_for(pkt, ok))
             dest = "broadcast" if pkt.to == BROADCAST else node_id(pkt.to)
-            log.info("TX text -> %s ch%d ok=%s%s: %r", dest, pkt.channel, ok,
-                     " (waiting for recipient ack)" if tracked else "", text)
+            log.info("TX text -> %s ch%d ok=%s%s (%d chars)", dest, pkt.channel, ok,
+                     " (waiting for recipient ack)" if tracked else "", len(text))
+            log.debug("TX text -> %s: %r", dest, text)
         elif port == portnums_pb2.ADMIN_APP:
             try:
                 await self.handle_admin(c, pkt)
@@ -894,7 +1230,28 @@ class Bridge:
         if entry:
             log.info("no confirmation from %s within %ds; app shows 'relayed, not confirmed'",
                      node_id(entry[1]), seconds)
+            self.remember_dm(mp_id, entry[0], "timed_out")
             self.broadcast(packet=self.routing_packet(self.my_num, entry[0]))
+
+    def remember_dm(self, mp_id, phone_id, state):
+        self.dm_history[mp_id] = (phone_id, state)
+        self.dm_history.move_to_end(mp_id)
+        while len(self.dm_history) > DM_HISTORY_MAX:
+            self.dm_history.popitem(last=False)
+
+    def complete_dm(self, mp_id, phone_id, src, err):
+        """Pass the recipient's real confirmation (or failure) for a DM to the app."""
+        log.info("DM %s by %s", "confirmed" if err == 0 else f"failed (error {err})", node_id(src))
+        self.remember_dm(mp_id, phone_id, "done")
+        self.broadcast(packet=self.routing_packet(src, phone_id, err))
+
+    def take_early_ack(self, mp_id):
+        """(source, error) of an ack that arrived before its send request finished, if any."""
+        now = time.monotonic()
+        for k in [k for k, v in self.early_acks.items() if now - v[2] > EARLY_ACK_HOLD]:
+            del self.early_acks[k]
+        early = self.early_acks.pop(mp_id, None)
+        return early[:2] if early else None
 
     async def on_routing_event(self, d, dp):
         """An ack/nak addressed to the Meshpoint: pass the recipient's real confirmation to the app."""
@@ -911,13 +1268,26 @@ class Bridge:
                 err = mesh_pb2.Routing.Error.Value(str(err).upper())
             except ValueError:
                 err = 0
-        entry = self.pending.pop(req, None) if req is not None else None
-        if not entry:
-            log.info("routing packet from %s not matched to a pending DM: %s", node_id(src), json.dumps(dp)[:200])
+        if req is None:
+            log.debug("routing packet from %s without a request id: %s", node_id(src), json.dumps(dp)[:200])
             return
-        phone_id = entry[0]
-        log.info("DM %s by %s", "confirmed" if err == 0 else f"failed (error {err})", node_id(src))
-        self.broadcast(packet=self.routing_packet(src, phone_id, err))
+        entry = self.pending.pop(req, None)
+        if entry:
+            self.complete_dm(req, entry[0], src, err)
+            return
+        past = self.dm_history.get(req)
+        if past:
+            phone_id, state = past
+            if state == "timed_out":  # the confirmation came after we stopped waiting: still tell the app
+                log.info("late confirmation from %s for a DM that had timed out", node_id(src))
+                self.complete_dm(req, phone_id, src, err)
+            else:
+                log.debug("duplicate routing packet from %s for an already confirmed DM", node_id(src))
+            return
+        # Possibly the ack for a DM whose send request has not returned yet: hold it briefly.
+        self.take_early_ack(-1)  # prunes expired entries
+        self.early_acks[req] = (src, err, time.monotonic())
+        log.debug("routing packet from %s for %08x not matched yet; holding it %ds", node_id(src), req, EARLY_ACK_HOLD)
 
     async def share_nodeinfo(self, c, pkt):
         """The app's 'exchange user info': have the Meshpoint broadcast its own NodeInfo now.
@@ -996,7 +1366,8 @@ class Bridge:
         text = dp if isinstance(dp, str) else (pick(dp, "text", "message", "msg", "body") if isinstance(dp, dict) else None)
         if not isinstance(text, str):
             if "text" in str(d.get("packet_type", "")).lower():
-                log.warning("text-type packet but no text field found; decoded_payload=%r", dp)
+                log.warning("text-type packet but no text field found; decoded_payload fields: %s",
+                            sorted(dp) if isinstance(dp, dict) else type(dp).__name__)
             return  # only text is forwarded in this draft
         pid = str(d.get("packet_id", ""))
         if pid and self.seen_before(pid):
@@ -1013,7 +1384,10 @@ class Bridge:
             h = d.get("channel_hash")
             chan = self.hash_to_idx.get(h)
             if chan is None:
-                log.warning("text on unknown channel_hash %s; known=%s (using channel 0)", h, self.hash_to_idx)
+                if dst == self.my_num and str(h).lower() in ("0", "00", "0x0", "0x00", "none"):
+                    pass  # a public-key encrypted DM carries no channel hash
+                else:
+                    log.warning("text on unknown channel_hash %s; known=%s (using channel 0)", h, self.hash_to_idx)
                 chan = 0
         pkt = mesh_pb2.MeshPacket()
         setattr(pkt, "from", src)
@@ -1039,7 +1413,8 @@ class Bridge:
             if pick(dp, "emoji") not in (None, "", 0, False, "0"):
                 pkt.decoded.emoji = 1  # flag only; the emoji glyph itself is the text payload
         self.broadcast(packet=pkt)
-        log.info("RX text from %s ch%s: %r", node_id(src), chan, text[:40])
+        log.info("RX text from %s ch%s (%d chars)", node_id(src), chan, len(text))
+        log.debug("RX text from %s: %r", node_id(src), text)
 
     async def ws_loop(self):
         while True:
@@ -1047,6 +1422,9 @@ class Bridge:
             try:
                 async with self.session.ws_connect(f"{self.base}/ws", heartbeat=30) as ws:
                     log.info("connected to Meshpoint websocket")
+                    self.ws_connects += 1
+                    if self.ws_connects > 1:  # Meshpoint may have restarted with a different identity
+                        self.spawn(self.check_identity())
                     async for m in ws:
                         if m.type == aiohttp.WSMsgType.TEXT:
                             try:
@@ -1105,8 +1483,13 @@ class Bridge:
 
     # ---- TCP server
     async def handle_client(self, reader, writer):
-        c = Client(writer)
         peer = writer.get_extra_info("peername")
+        # Allowlist check first: a refused device must not replace (disconnect) the current phone.
+        if not ip_allowed(peer[0] if peer else "", getattr(self.args, "allow_nets", None) or []):
+            log.warning("refused connection from %s: not in BRIDGE_ALLOW", peer[0] if peer else "unknown address")
+            writer.close()
+            return
+        c = Client(writer)
         # A real Meshtastic node serves one phone at a time: a new connection replaces the old one.
         for old in list(self.clients):
             log.info("closing previous phone connection %s (replaced by %s)", old.peer, peer)
@@ -1178,12 +1561,23 @@ class Bridge:
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None, connect=10),
                                          cookie_jar=aiohttp.CookieJar(unsafe=True),
                                          connector=aiohttp.TCPConnector(force_close=True)) as self.session:
+            self.main_task = asyncio.current_task()
             self.creds = await ensure_login(self.session, self.base, self.args)
+            await self.log_meshpoint_version()
             await self.load_config()
             await self.poll_nodes()
             log.info("loaded %d nodes", len(self.nodes))
-            server = await asyncio.start_server(self.handle_client, "0.0.0.0", self.args.listen_port)
-            azc = await self.advertise()
+            host = getattr(self.args, "listen_host", "0.0.0.0")
+            server = await asyncio.start_server(self.handle_client, host, self.args.listen_port)
+            allow = getattr(self.args, "allow_nets", None)
+            log.info("Meshtastic TCP API listening on %s:%d (no authentication, like a stock Meshtastic node; "
+                     "allowed clients: %s)", host, self.args.listen_port,
+                     ", ".join(map(str, allow)) if allow else "any")
+            if getattr(self.args, "mdns", True):
+                azc = await self.advertise()
+            else:
+                azc = None
+                log.info("mDNS advertising is off (BRIDGE_MDNS=0): add this host's IP manually in the app")
             try:
                 await asyncio.gather(server.serve_forever(), self.ws_loop(), self.nodes_loop())
             finally:
@@ -1199,14 +1593,28 @@ class Bridge:
                     except Exception as e:  # noqa
                         log.debug("mDNS shutdown error: %r", e)
 
+    async def log_meshpoint_version(self):
+        """Log the Meshpoint version (best effort) so test reports and bug reports carry it."""
+        try:
+            info = await self.get_json("/api/device/status")
+            log.info("Meshpoint version %s", pick(info, "firmware_version", "version", default="unknown"))
+        except Exception as e:  # noqa
+            log.debug("could not read Meshpoint version: %r", e)
+
     async def advertise(self):
         try:
             from zeroconf import ServiceInfo
             from zeroconf.asyncio import AsyncZeroconf
         except ImportError:
-            log.info("zeroconf not installed; add the Pi's IP manually in the app")
+            log.info("zeroconf not installed; add this device's IP manually in the app")
             return None
-        ips = [self.args.advertise_ip] if self.args.advertise_ip else local_ipv4s()
+        host = getattr(self.args, "listen_host", "0.0.0.0")
+        if self.args.advertise_ip:
+            ips = [self.args.advertise_ip]
+        elif host not in ("0.0.0.0", "::", "") and ipaddress.ip_address(host).version == 4:
+            ips = [host]  # bound to one address: advertise only that one
+        else:
+            ips = local_ipv4s()
         if not ips:
             log.warning("could not determine this machine's IP; add it manually in the app")
             return None
@@ -1217,7 +1625,7 @@ class Bridge:
         azc = AsyncZeroconf()
         await azc.async_register_service(info)
         log.info("advertising %s via mDNS on %s port %d (if the phone is on a different subnet/VLAN, "
-                 "mDNS won't reach it: add the Pi's IP manually in the app)", name, ", ".join(ips),
+                 "mDNS won't reach it: add this device's IP manually in the app)", name, ", ".join(ips),
                  self.args.listen_port)
         return azc
 
@@ -1276,33 +1684,205 @@ async def probe(args):
 
 
 async def amain(args):
-    """Run the bridge (or probe). SIGINT/SIGTERM cancel it cleanly so mDNS goodbyes and sockets get closed."""
+    """Run the bridge (or probe). SIGINT/SIGTERM cancel it cleanly so mDNS goodbyes and sockets get closed.
+    Returns the process exit code."""
     task = asyncio.current_task()
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, task.cancel)
+    bridge = None
     try:
-        await (probe(args) if args.probe else Bridge(args).run())
+        if args.probe:
+            await probe(args)
+        else:
+            bridge = Bridge(args)
+            await bridge.run()
     except asyncio.CancelledError:
         log.info("shutting down")
+    return bridge.exit_code if bridge else 0
+
+
+# ----------------------------------------------------------------- setup
+async def check_login(meshpoint, username, password):
+    """Setup helper: True = login works (or none needed), False = rejected, None = could not tell."""
+    base = f"http://{meshpoint}"
+    async with aiohttp.ClientSession(cookie_jar=aiohttp.CookieJar(unsafe=True),
+                                     connector=aiohttp.TCPConnector(force_close=True)) as s:
+        try:
+            async with s.get(f"{base}/api/config", timeout=REST_TIMEOUT) as r:
+                if r.status != 401:
+                    return True
+        except (aiohttp.ClientError, asyncio.TimeoutError, OSError):
+            print(f"  Could not reach the Meshpoint at {base}. Is the meshpoint service running?")
+            return None
+        try:
+            return await try_login(s, base, username, password)
+        except SystemExit as e:  # lockout, unexpected response, unreachable
+            print(f"  {e}")
+            return None
+
+
+def ask(prompt, default="", check=None):
+    """Prompt with a default; `check` raises ConfigError (or ValueError) for invalid input."""
+    while True:
+        value = input(f"{prompt} [{default}]: ").strip() if default else input(f"{prompt}: ").strip()
+        value = value or default
+        if value == "-":  # lets the user clear an optional value
+            value = ""
+        try:
+            if check:
+                check(value)
+            return value
+        except (ConfigError, ValueError) as e:
+            print(f"  {e}")
+
+
+def ask_yes_no(prompt, default):
+    while True:
+        v = input(f"{prompt} [{'Y/n' if default else 'y/N'}]: ").strip().lower()
+        if not v:
+            return default
+        if v in ("y", "yes"):
+            return True
+        if v in ("n", "no"):
+            return False
+
+
+def run_setup(args):
+    """Interactive first-time setup: writes the settings file the service reads at every start."""
+    path = args.config or DEFAULT_CONFIG
+    if not sys.stdin.isatty():
+        raise ConfigError("--setup asks questions, so it must be run in a terminal")
+    current = {}
+    if os.path.exists(path):
+        try:
+            current = read_env_file(path)
+        except PermissionError:
+            raise ConfigError(f"cannot read {path}: run setup with sudo")
+    print(f"meshpoint-bridge {__version__} setup. Settings file: {path}")
+    print("Press Enter to keep the value in [brackets]; enter - to clear an optional value.\n")
+
+    username = ask("Meshpoint dashboard username",
+                   current.get("MESHPOINT_USERNAME") or os.environ.get("MESHPOINT_USERNAME") or "admin")
+    saved = current.get("MESHPOINT_PASSWORD") or os.environ.get("MESHPOINT_PASSWORD")
+    password = None
+    for attempt in range(3):  # each wrong password counts toward the dashboard lockout, so stop at 3
+        pw = getpass.getpass("Meshpoint dashboard password" + (" (Enter keeps the saved one)" if saved else "") + ": ")
+        pw = pw or saved
+        if not pw:
+            print("  A password is needed.")
+            continue
+        if "\n" in pw or "\r" in pw:
+            print("  The password cannot contain line breaks.")
+            continue
+        result = asyncio.run(check_login(args.meshpoint, username, pw))
+        if result:
+            print("  Login OK.")
+            password = pw
+            break
+        if result is None:
+            if ask_yes_no("  Could not check the login. Save this password anyway?", False):
+                password = pw
+                break
+            continue
+        print("  Login failed: check the username and password you use for the Meshpoint dashboard.")
+        saved = None
+    if password is None:
+        raise ConfigError("setup stopped: no working dashboard password (nothing was saved)")
+
+    def check_host(v):
+        ipaddress.ip_address(v)
+
+    def check_node(v):
+        if v and node_num(v) in (None, 0, BROADCAST):
+            raise ValueError("expected a node id like !a1b2c3d4, or - for none")
+
+    listen_host = ask("Listen address for the Meshtastic app (0.0.0.0 = all interfaces)",
+                      current.get("BRIDGE_LISTEN_HOST") or "0.0.0.0", check_host)
+    allow = ask("Allowed client IPs/networks, comma-separated (blank = anyone)",
+                current.get("BRIDGE_ALLOW", ""), parse_allowlist)
+    mdns = ask_yes_no("Advertise the bridge via mDNS so the app finds it automatically?",
+                      parse_bool(current.get("BRIDGE_MDNS") or "1", "BRIDGE_MDNS"))
+    rx_only = ask_yes_no("Receive-only (never transmit; sends from the app are rejected)?",
+                         parse_bool(current.get("BRIDGE_RX_ONLY") or "0", "BRIDGE_RX_ONLY"))
+    node = ask("Node id to use only if Meshpoint has none, e.g. !a1b2c3d4 (blank = this device's MAC)",
+               current.get("BRIDGE_NODE_ID", ""), check_node)
+
+    values = dict(current)
+    values.update({
+        "MESHPOINT_USERNAME": username,
+        "MESHPOINT_PASSWORD": password,
+        "BRIDGE_LISTEN_HOST": listen_host,
+        "BRIDGE_ALLOW": allow,
+        "BRIDGE_MDNS": "1" if mdns else "0",
+        "BRIDGE_RX_ONLY": "1" if rx_only else "0",
+        "BRIDGE_NODE_ID": node,
+    })
+    try:
+        write_env_file(path, values)
+    except PermissionError:
+        raise ConfigError(f"cannot write {path}: run setup with sudo")
+    print(f"\nSaved {path} (mode 600).")
+    if os.path.abspath(path) != DEFAULT_CONFIG:
+        print(f"Run the bridge with these settings: python3 meshpoint_bridge.py --config {path}")
+    elif os.path.exists(SERVICE_UNIT):
+        print("Apply the changes with: sudo systemctl restart meshpoint-bridge")
+    return 0
 
 
 def main():
-    p = argparse.ArgumentParser()
-    p.add_argument("--meshpoint", default="127.0.0.1:8080", help="host:port of the Meshpoint API")
-    p.add_argument("--listen-port", type=int, default=4403)
-    p.add_argument("--advertise-ip", default=None)
-    p.add_argument("--node-id", default=None, help="override node id, e.g. !a1b2c3d4")
-    p.add_argument("--username", default=os.environ.get("MESHPOINT_USERNAME"),
-                   help="Meshpoint dashboard username (default: admin, or set MESHPOINT_USERNAME)")
-    p.add_argument("--password", default=os.environ.get("MESHPOINT_PASSWORD"),
-                   help="Meshpoint dashboard password (or set MESHPOINT_PASSWORD)")
+    p = argparse.ArgumentParser(
+        description="Meshtastic TCP API bridge for a Meshpoint gateway. Settings come from the "
+                    f"settings file ({DEFAULT_CONFIG}, created with --setup); options below override it.")
+    p.add_argument("--version", action="version", version=f"meshpoint-bridge {__version__}")
+    p.add_argument("--config", default=None, metavar="PATH",
+                   help=f"settings file (default: {DEFAULT_CONFIG} if it exists)")
+    p.add_argument("--setup", action="store_true", help="create or change the settings file interactively, then exit")
+    p.add_argument("--show-config", action="store_true",
+                   help="print the settings in effect (password hidden) and where each came from, then exit")
     p.add_argument("--probe", action="store_true", help="dump Meshpoint API shapes and exit")
-    p.add_argument("-v", "--verbose", action="store_true")
+    p.add_argument("--meshpoint", default="127.0.0.1:8080", help=argparse.SUPPRESS)
+    p.add_argument("--username", default=None, help="Meshpoint dashboard username (MESHPOINT_USERNAME)")
+    p.add_argument("--password", default=None, help="Meshpoint dashboard password (MESHPOINT_PASSWORD)")
+    p.add_argument("--listen-host", default=None, help="listen address (BRIDGE_LISTEN_HOST, default 0.0.0.0)")
+    p.add_argument("--listen-port", type=int, default=None, help="listen port (BRIDGE_LISTEN_PORT, default 4403)")
+    p.add_argument("--allow", default=None, help="allowed client IPs/networks, comma-separated (BRIDGE_ALLOW)")
+    p.add_argument("--no-mdns", dest="mdns", action="store_const", const=False, default=None,
+                   help="do not advertise via mDNS (BRIDGE_MDNS=0)")
+    p.add_argument("--advertise-ip", default=None, help="advertise only this IPv4 address (BRIDGE_ADVERTISE_IP)")
+    p.add_argument("--rx-only", dest="rx_only", action="store_const", const=True, default=None,
+                   help="receive-only: never transmit (BRIDGE_RX_ONLY=1)")
+    p.add_argument("--node-id", default=None,
+                   help="node id used only when Meshpoint reports none, e.g. !a1b2c3d4 (BRIDGE_NODE_ID)")
+    p.add_argument("-v", "--verbose", action="store_true", help="debug logging (includes message text)")
     args = p.parse_args()
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
                         format="%(asctime)s %(levelname)s %(message)s")
-    asyncio.run(amain(args))
+    try:
+        if args.setup:
+            sys.exit(run_setup(args))
+        load_settings(args)
+        if args.show_config:
+            print(format_settings(args))
+            return
+        log.info("meshpoint-bridge %s (Python %s, meshtastic %s)", __version__,
+                 sys.version.split()[0], package_version("meshtastic"))
+        if args.config_path:
+            log.info("settings: %s", args.config_path)
+        sys.exit(asyncio.run(amain(args)) or 0)
+    except ConfigError as e:
+        log.error("%s", e)
+        sys.exit(EXIT_CONFIG)
+    except KeyboardInterrupt:
+        sys.exit(130)
+
+
+def package_version(name):
+    try:
+        from importlib.metadata import version
+        return version(name)
+    except Exception:  # noqa
+        return "unknown"
 
 
 if __name__ == "__main__":

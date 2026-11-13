@@ -2,6 +2,36 @@
 
 ## Unreleased
 
+### Fixes from live testing (November 13, 2026)
+
+- `--setup` now tells you how to apply the new settings for the file you changed: the restart command only when the service is installed, or the `--config` command for a settings file of your own.
+- Messages no longer assume the bridge runs on a Raspberry Pi: the mDNS log lines say "this device's IP", the login hint points to `http://<meshpoint-ip>:8080`, and the installer no longer mentions a Pi.
+- README and `docs/TESTING.md`: recorded the November 13 results, including how the iPhone app shows receive-only mode.
+- `docs/TESTING.md`: recorded the service tests (upgrade over a manual install, boot, setup with a wrong password, Meshpoint restarting, uninstall and reinstall). The README notes Meshpoint's login lockout (5 failed attempts, 5 minutes).
+- A DM recipient's acknowledgement that arrives before Meshpoint answers the send request is no longer lost. Previously the bridge discarded it and, 60 seconds later, told the app "relayed, not confirmed" for a message that had been delivered. Such acks are now held for 30 seconds and applied as soon as the send returns.
+- A confirmation that arrives after the 60-second wait is still passed to the app; a duplicate acknowledgement (the same ack heard twice via a relay) is logged at debug level instead of "not matched".
+- Incoming public-key encrypted DMs, which carry no channel hash, no longer log an "unknown channel_hash" warning.
+
+### Service, settings and access-control update (not yet live-verified on hardware)
+
+Added:
+
+- `install.sh`: installs the bridge as a systemd service running as a dedicated `meshpoint-bridge` user (no login shell, no sudo rights), with its own Python environment in `/opt/meshpoint-bridge`. Re-running it upgrades in place, including an earlier manual install; `--uninstall` removes it and asks before deleting the settings.
+- `systemd/meshpoint-bridge.service`: starts after Meshpoint at boot, retries with a growing delay while Meshpoint is unavailable, does not restart after a settings or password error (exit code 78), and runs sandboxed.
+- Settings file `/etc/meshpoint-bridge/bridge.env` (mode 600), read at every start, created and changed with `--setup` (which checks the dashboard login before saving). Every setting can also be given as an environment variable or command-line option. Added `bridge.env.example`.
+- `--show-config` (settings in effect and where each came from, password hidden) and `--version`. The bridge, Python, `meshtastic` and Meshpoint versions are logged at startup.
+- Access controls that keep the stock Meshtastic no-authentication model: `BRIDGE_LISTEN_HOST` (bind address), `BRIDGE_ALLOW` (IP/network allowlist, checked before a new connection can replace the current phone) and `BRIDGE_MDNS` (turn off mDNS advertising).
+- Receive-only mode: used when Meshpoint has no transmit node ID or transmit is disabled, or when `BRIDGE_RX_ONLY=1`. The app is told transmit is disabled, received traffic is still forwarded, and anything the app sends is rejected immediately without reaching Meshpoint's send API.
+
+Changed:
+
+- The node ID shown in the app now always comes from Meshpoint's transmit identity. A different `BRIDGE_NODE_ID` / `--node-id` is ignored with an error. The MAC-address ID is used only in receive-only mode, and the random-ID fallback was removed: with no usable ID the bridge stops with an error.
+- If Meshpoint's identity changes while running (checked after a re-login or WebSocket reconnect), the bridge exits with code 75 so the service restarts it with the new identity.
+- Message text is no longer logged by default: INFO logs record sender/destination, channel, length and status, and the text appears only with `-v`. A text event without a text field logs its field names instead of its contents.
+- Wrong dashboard credentials, a missing password when not interactive, an unexpected login API and invalid settings now exit with code 78.
+- `requirements.txt` pins the tested versions: `meshtastic` 2.7.11, `protobuf` 7.36.2, `aiohttp` 3.14.5, `zeroconf` 0.154.0.
+- The README records the tested versions (Debian 13.6, Python 3.13.5, Meshpoint v0.7.9, Meshtastic app 2.7.28 on iPhone 16e) and documents installation, settings, node identity, receive-only mode and security.
+
 ### Hardening update (not yet live-verified on hardware)
 
 Fixed:
