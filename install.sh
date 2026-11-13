@@ -112,7 +112,7 @@ install_files() {
 
 build_venv() {
     # Build a fresh venv; keep the old one until the new one works, so a failed upgrade can be undone.
-    say "Creating the Python environment (this can take a few minutes on a Pi)"
+    say "Creating the Python environment (this can take a few minutes)"
     rm -rf "$INSTALL_DIR/venv.old"
     if [[ -d "$INSTALL_DIR/venv" ]]; then mv "$INSTALL_DIR/venv" "$INSTALL_DIR/venv.old"; fi
     if python3 -m venv "$INSTALL_DIR/venv" \

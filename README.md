@@ -178,6 +178,8 @@ The bridge runs receive-only when:
 
 In receive-only mode everything Meshpoint hears (text, node info, positions, telemetry) is still forwarded to the app, the app is told transmit is disabled (`lora.tx_enabled = false`), and anything the app tries to send is rejected immediately with a failure acknowledgement. Nothing is passed to Meshpoint's send API. Read-only admin requests from the app are still answered.
 
+In the iPhone Meshtastic app (2.7.28) this shows as **Transmit** turned off in the LoRa settings, and a message sent anyway fails immediately with "no radio interface".
+
 This deliberately differs from a stock Meshtastic node with transmit disabled: the firmware drops the packet without telling the app, which waits and eventually shows "Failed to deliver to mesh". The bridge fails the send right away (routing error `NO_INTERFACE`) so it is clear the message was not sent.
 
 ## Settings

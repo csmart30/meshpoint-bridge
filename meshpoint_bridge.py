@@ -51,6 +51,7 @@ __version__ = "0.1.0"
 
 DEFAULT_CONFIG = "/etc/meshpoint-bridge/bridge.env"
 SERVICE_USER = "meshpoint-bridge"
+SERVICE_UNIT = "/etc/systemd/system/meshpoint-bridge.service"
 # Exit codes (the systemd unit restarts on failure, except for EXIT_CONFIG: retrying a bad
 # setting or a wrong password every few seconds would only trip the dashboard lockout).
 EXIT_CONFIG = 78   # EX_CONFIG: fix the settings, then start again
@@ -629,7 +630,7 @@ async def try_login(session, base, username, password):
 
 
 VERIFY_MSG = ("Login failed. Please verify the username and password you use to log in to your "
-              "local Meshpoint dashboard (http://<pi-ip>:8080) and try again.")
+              "local Meshpoint dashboard (http://<meshpoint-ip>:8080) and try again.")
 
 
 async def ensure_login(session, base, args):
@@ -1560,7 +1561,7 @@ class Bridge:
             from zeroconf import ServiceInfo
             from zeroconf.asyncio import AsyncZeroconf
         except ImportError:
-            log.info("zeroconf not installed; add the Pi's IP manually in the app")
+            log.info("zeroconf not installed; add this device's IP manually in the app")
             return None
         host = getattr(self.args, "listen_host", "0.0.0.0")
         if self.args.advertise_ip:
@@ -1579,7 +1580,7 @@ class Bridge:
         azc = AsyncZeroconf()
         await azc.async_register_service(info)
         log.info("advertising %s via mDNS on %s port %d (if the phone is on a different subnet/VLAN, "
-                 "mDNS won't reach it: add the Pi's IP manually in the app)", name, ", ".join(ips),
+                 "mDNS won't reach it: add this device's IP manually in the app)", name, ", ".join(ips),
                  self.args.listen_port)
         return azc
 
@@ -1777,7 +1778,10 @@ def run_setup(args):
     except PermissionError:
         raise ConfigError(f"cannot write {path}: run setup with sudo")
     print(f"\nSaved {path} (mode 600).")
-    print("If the service is installed, apply the changes with: sudo systemctl restart meshpoint-bridge")
+    if os.path.abspath(path) != DEFAULT_CONFIG:
+        print(f"Run the bridge with these settings: python3 meshpoint_bridge.py --config {path}")
+    elif os.path.exists(SERVICE_UNIT):
+        print("Apply the changes with: sudo systemctl restart meshpoint-bridge")
     return 0
 
 

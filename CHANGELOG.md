@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Fixes from live testing (November 13, 2026)
+
+- `--setup` now tells you how to apply the new settings for the file you changed: the restart command only when the service is installed, or the `--config` command for a settings file of your own.
+- Messages no longer assume the bridge runs on a Raspberry Pi: the mDNS log lines say "this device's IP", the login hint points to `http://<meshpoint-ip>:8080`, and the installer no longer mentions a Pi.
+- README and `docs/TESTING.md`: recorded the November 13 results, including how the iPhone app shows receive-only mode.
+
 ### Service, settings and access-control update (not yet live-verified on hardware)
 
 Added:
