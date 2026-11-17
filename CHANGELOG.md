@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Honest admin replies
+
+- Settings changes from the app (`set_config`, `set_owner`, channels, favorites, `add_contact`, `set_time_only` and other admin changes) are now refused with the routing error `NOT_AUTHORIZED` instead of being acknowledged as applied. The bridge never applied them; the app now keeps showing the real name and favorite state instead of a change that did not happen. Connecting and DMs are unaffected (tested live with the iPhone app).
+- The `set_time_only` refusal sent on every connect is logged at debug level only.
+
 ### Documentation
 
 - Added `docs/API_CONTRACT.md`: every Meshpoint REST endpoint, WebSocket event and field the bridge uses, how it authenticates and handles errors, and the open items on both sides (for KMX415/meshpoint#172).
