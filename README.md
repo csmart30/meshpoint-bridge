@@ -85,7 +85,7 @@ Items marked *not yet live-verified* were added in a hardening update. They are 
 The following are **not implemented yet**:
 
 - Five-day node-list retention with older nodes retained only when locally favorited.
-- Persisting favorite/unfavorite actions from the native Meshtastic app to a bridge-local favorites file. The current bridge refuses `set_favorite_node`, so favorites set in the app are not kept.
+- Persisting favorite/unfavorite actions from the native Meshtastic app to a bridge-local favorites file. The current bridge refuses `set_favorite_node`, so favorites set in the app are lost when the app reconnects.
 - Increase support for more Meshtastic packet types and administration operations (traceroute, direct node info exchanges). Both need Meshpoint support first.
 - Replies and tapbacks in either direction. A `--probe` capture on November 11, 2026 showed that Meshpoint's WebSocket events do not include the Meshtastic `reply_id` or `emoji` (tapback) fields, so a tapback arrives as a plain text packet containing the emoji. Meshpoint's `POST /api/messages/send` request also has no fields for them, so replies and tapbacks sent from the phone go out as plain text. This needs a change in Meshpoint; an issue is being raised on the Meshpoint repository.
 
@@ -191,7 +191,7 @@ Meshpoint cannot yet send a direct NodeInfo request to one node and wait for its
 
 The bridge does not apply settings changes sent from the Meshtastic app: owner name, radio and module config, channels, favorites, contacts and time. Meshpoint has no API for them, and its settings belong in the Meshpoint dashboard. The bridge refuses each change with the routing error `NOT_AUTHORIZED`, the same error firmware uses when it refuses an admin change.
 
-The app (tested with iPhone app 2.7.28) shows no error message for this, but it does not keep the change: after renaming the node or favoriting another node, the old name or favorite state is shown again when you revisit it. Connecting and sending messages work normally, including DMs (the app favorites the recipient before each DM; that favorite is refused but the message is still sent).
+The app (tested with iPhone app 2.7.28) shows no error message for this. A renamed node keeps its real name: after saving, the app still shows Meshpoint's name. Favorites are different, because the app updates its own copy first: a node favorited from the node list stays starred until the app is closed or reconnects, and the automatic favorite before a DM is gone as soon as the node list reloads. Connecting and sending messages work normally, including DMs (that automatic favorite is refused but the message is still sent).
 
 ## Settings
 

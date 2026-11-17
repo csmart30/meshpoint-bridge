@@ -8,8 +8,9 @@
 
 ### Honest admin replies
 
-- Settings changes from the app (`set_config`, `set_owner`, channels, favorites, `add_contact`, `set_time_only` and other admin changes) are now refused with the routing error `NOT_AUTHORIZED` instead of being acknowledged as applied. The bridge never applied them; the app now keeps showing the real name and favorite state instead of a change that did not happen. Connecting and DMs are unaffected (tested live with the iPhone app).
+- Settings changes from the app (`set_config`, `set_owner`, channels, favorites, `add_contact`, `set_time_only` and other admin changes) are now refused with the routing error `NOT_AUTHORIZED` instead of being acknowledged as applied. The bridge never applied them; the app is no longer told they succeeded. Connecting and DMs are unaffected (tested live with the iPhone app).
 - The `set_time_only` refusal sent on every connect is logged at debug level only.
+- The app shows no error for a refused change. A refused rename never shows; a refused favorite is shown at first and disappears when the app reloads its node list or reconnects.
 
 ### Documentation
 
