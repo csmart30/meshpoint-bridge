@@ -1123,8 +1123,9 @@ class Bridge:
 
     async def handle_admin(self, c, pkt):
         """Answer the read-only admin requests the app makes. Settings changes are not applied
-        (use the Meshpoint dashboard), but if the app asked for an ack we still send one so it
-        does not sit waiting for a reply and drop the connection."""
+        (use the Meshpoint dashboard), so they are refused with NOT_AUTHORIZED, the same error
+        firmware uses when it refuses an admin change. The app shows no error for this, but it
+        does not keep the change (e.g. the old name or favorite state remains)."""
         am = admin_pb2.AdminMessage()
         try:
             am.ParseFromString(pkt.decoded.payload)
@@ -1143,19 +1144,27 @@ class Bridge:
             resp.get_device_metadata_response.CopyFrom(self.make_metadata())
         else:
             answered = False
-            if which and which.startswith(("set_", "begin_", "commit_", "remove_", "reboot", "factory", "nodedb")):
-                if which != "set_time_only":
-                    log.info("admin: %s NOT applied - change settings in the Meshpoint dashboard instead", which)
-            else:
-                log.info("admin: %s not supported", which)
         if answered:
             rp = self.new_packet(self.my_num, self.my_num, portnums_pb2.ADMIN_APP,
                                  resp.SerializeToString(), request_id=pkt.id)
             await self.to_client(c, packet=rp)
             log.debug("admin: answered %s", which)
-        elif pkt.want_ack:
+            return
+        is_change = bool(which) and not which.startswith("get_")
+        if is_change:
+            # set_time_only arrives on every connect; not worth an INFO line each time
+            (log.debug if which == "set_time_only" else log.info)(
+                "admin: %s refused (NOT_AUTHORIZED) - change settings in the Meshpoint dashboard instead", which)
+        else:
+            log.info("admin: %s not supported", which)
+        if not (pkt.want_ack or pkt.decoded.want_response):
+            return
+        if is_change:
+            await self.to_client(c, packet=self.routing_packet(self.my_num, pkt.id, mesh_pb2.Routing.NOT_AUTHORIZED))
+        else:
+            # unsupported read request: ack so the app does not sit waiting for a reply
             await self.to_client(c, packet=self.ack_for(pkt))
-            log.debug("admin: acked %s (not applied)", which)
+            log.debug("admin: acked %s (no answer)", which)
 
     # ---- phone -> mesh
     async def handle_tx(self, c, pkt):

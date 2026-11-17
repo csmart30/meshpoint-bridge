@@ -71,7 +71,7 @@ The bridge presents a virtual Meshtastic node to the phone. Meshpoint remains re
 - NodeInfo and position forwarding, including Meshpoint-reported hop count and SNR.
 - Device-metric forwarding for battery percentage, voltage, channel utilization, and transmit airtime utilization when Meshpoint supplies those values. Hop count and battery percentage have been observed in the native app; the other metrics still need individual live verification.
 - Environmental temperature and relative-humidity forwarding through Meshtastic `TELEMETRY_APP`; both have been verified in the native app and matched Meshpoint readings.
-- Read-only responses to selected admin queries.
+- Read-only responses to selected admin queries. Settings changes from the app (owner name, config, channels, favorites, contacts, time) are not applied and are refused with `NOT_AUTHORIZED`; see [Settings changes from the app](#settings-changes-from-the-app).
 - The node ID shown in the app always matches the ID Meshpoint transmits with (see [Node identity](#node-identity)) *(not yet live-verified)*.
 - Nodes whose reported position is exactly 0,0 are treated as having no GPS position and are shown without a map pin *(not yet live-verified)*.
 - Receive-side support for replies and tapbacks: if a Meshpoint event carries a reply ID or tapback flag, it is forwarded to the app. Meshpoint does not currently include these fields (see limitations below), so for now replies and tapbacks from the mesh appear in the app as ordinary text messages.
@@ -84,7 +84,7 @@ Items marked *not yet live-verified* were added in a hardening update. They are 
 The following are **not implemented yet**:
 
 - Five-day node-list retention with older nodes retained only when locally favorited.
-- Persisting favorite/unfavorite actions from the native Meshtastic app to a bridge-local favorites file. The current bridge acknowledges `set_favorite_node` but does not persist it.
+- Persisting favorite/unfavorite actions from the native Meshtastic app to a bridge-local favorites file. The current bridge refuses `set_favorite_node`, so favorites set in the app are not kept.
 - Increase support for more Meshtastic packet types and administration operations (traceroute, node info exchanges).
 - Replies and tapbacks in either direction. A `--probe` capture on November 11, 2026 showed that Meshpoint's WebSocket events do not include the Meshtastic `reply_id` or `emoji` (tapback) fields, so a tapback arrives as a plain text packet containing the emoji. Meshpoint's `POST /api/messages/send` request also has no fields for them, so replies and tapbacks sent from the phone go out as plain text. This needs a change in Meshpoint; an issue is being raised on the Meshpoint repository.
 
@@ -182,6 +182,12 @@ In the iPhone Meshtastic app (2.7.28) this shows as **Transmit** turned off in t
 
 This deliberately differs from a stock Meshtastic node with transmit disabled: the firmware drops the packet without telling the app, which waits and eventually shows "Failed to deliver to mesh". The bridge fails the send right away (routing error `NO_INTERFACE`) so it is clear the message was not sent.
 
+## Settings changes from the app
+
+The bridge does not apply settings changes sent from the Meshtastic app: owner name, radio and module config, channels, favorites, contacts and time. Meshpoint has no API for them, and its settings belong in the Meshpoint dashboard. The bridge refuses each change with the routing error `NOT_AUTHORIZED`, the same error firmware uses when it refuses an admin change.
+
+The app (tested with iPhone app 2.7.28) shows no error message for this, but it does not keep the change: after renaming the node or favoriting another node, the old name or favorite state is shown again when you revisit it. Connecting and sending messages work normally, including DMs (the app favorites the recipient before each DM; that favorite is refused but the message is still sent).
+
 ## Settings
 
 Settings are read from `/etc/meshpoint-bridge/bridge.env` at every start (see [`bridge.env.example`](bridge.env.example)). Each setting can also be given as an environment variable of the same name or a command-line option; the order is command line, then environment, then the settings file, then the default.
@@ -202,7 +208,7 @@ Other options: `--config PATH` (another settings file), `--setup`, `--show-confi
 
 ## Security
 
-**Network access.** Like a stock Meshtastic node, the bridge's TCP API on port `4403` has no authentication: any device that can reach it can connect as a client. This matches how the Meshtastic app expects to connect (it has no way to send a password). Run it only on a trusted LAN and never expose port `4403` to the internet. Unlike a real node, the bridge answers admin requests read-only, so a connected client cannot change radio or Meshpoint settings.
+**Network access.** Like a stock Meshtastic node, the bridge's TCP API on port `4403` has no authentication: any device that can reach it can connect as a client. This matches how the Meshtastic app expects to connect (it has no way to send a password). Run it only on a trusted LAN and never expose port `4403` to the internet. Unlike a real node, the bridge answers admin requests read-only and refuses changes, so a connected client cannot change radio or Meshpoint settings.
 
 To limit exposure:
 
