@@ -1299,25 +1299,29 @@ class Bridge:
         log.debug("routing packet from %s for %08x not matched yet; holding it %ds", node_id(src), req, EARLY_ACK_HOLD)
 
     async def share_nodeinfo(self, c, pkt):
-        """The app's 'exchange user info': have the Meshpoint broadcast its own NodeInfo now.
-        (The Meshpoint can't send a targeted request, so the other node may not reply right away;
-        any NodeInfo we hear from it still appears in the app immediately.)"""
-        ok = False
+        """The app's 'exchange user info'. A direct NodeInfo request/reply is not supported (Meshpoint
+        cannot send one yet, see the Meshpoint issue tracker), so the app is told the request failed
+        (BAD_REQUEST). As a fallback, Meshpoint still broadcasts its own NodeInfo (at most every
+        5 minutes); any NodeInfo heard from the other node still appears in the app right away."""
+        dest = node_id(pkt.to)
         wait = 300 - (time.time() - self.last_nodeinfo_tx)
         if wait > 0:
-            log.info("user info request: Meshpoint sent its NodeInfo recently, not repeating (try again in %ds)", wait)
-            ok = True
+            log.info("user info request to %s: direct exchange not supported; Meshpoint sent its NodeInfo "
+                     "broadcast recently, not repeating (try again in %ds)", dest, wait)
         else:
             try:
                 status, body = await self.call("POST", "/api/config/nodeinfo/send")
-                ok = status < 300
-                log.info("user info request -> Meshpoint broadcasting its NodeInfo: %s %s", status, body[:120])
-                if ok:
+                if status < 300:
                     self.last_nodeinfo_tx = time.time()
+                    log.info("user info request to %s: direct exchange not supported; "
+                             "Meshpoint broadcast its NodeInfo instead", dest)
+                else:
+                    log.warning("user info request to %s: direct exchange not supported; "
+                                "NodeInfo broadcast failed: %s %s", dest, status, body[:120])
             except Exception as e:  # noqa
                 log.warning("nodeinfo send error: %r", e)
-        if pkt.want_ack:
-            await self.to_client(c, packet=self.ack_for(pkt, ok))
+        if pkt.want_ack or pkt.decoded.want_response:
+            await self.to_client(c, packet=self.routing_packet(self.my_num, pkt.id, mesh_pb2.Routing.BAD_REQUEST))
 
     # ---- mesh -> phone
     def seen_before(self, pid):

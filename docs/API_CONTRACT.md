@@ -141,7 +141,7 @@ Response: any `2xx` is treated as sent; the packet ID in `packet_id` \| `id` (8 
 
 ## `POST /api/config/nodeinfo/send`
 
-No request body. Asks Meshpoint to broadcast its own NodeInfo; any `2xx` is treated as done. Currently called when the app asks to exchange user info with a node, at most once every 5 minutes. This is a broadcast, not the targeted request/reply the app expects, so it is due to be replaced by an "unsupported" reply until [KMX415/meshpoint#171](https://github.com/KMX415/meshpoint/issues/171) exists.
+No request body. Asks Meshpoint to broadcast its own NodeInfo; any `2xx` is treated as done. Currently called when the app asks to exchange user info with a node, at most once every 5 minutes. This is a broadcast, not the targeted request/reply the app expects, so the bridge also tells the app the exchange is unsupported (`BAD_REQUEST`) until [KMX415/meshpoint#171](https://github.com/KMX415/meshpoint/issues/171) exists. The broadcast is kept as a fallback so other nodes still learn Meshpoint's name and public key.
 
 ## WebSocket `/ws`
 
@@ -194,5 +194,5 @@ These affect the contract and are tracked on the Meshpoint side or in this repos
 1. **Scoped credentials.** The bridge needs the dashboard admin password today. A token or role limited to `GET /api/config`, `GET /api/nodes`, `POST /api/messages/send` and `/ws` would reduce the risk of storing it.
 2. **Reply and tapback fields.** WebSocket text events from v0.7.9 do not include the reply ID or emoji flag, so replies and tapbacks reach the app as plain messages. The bridge already reads `reply_id` and `emoji` if they are added.
 3. **Inbound DM acknowledgements.** Acknowledging DMs sent *to* the Meshpoint is done by Meshpoint's radio stack, not the bridge. On v0.7.9 Meshpoint logs sending the routing ack, but senders do not appear to accept it.
-4. **NodeInfo request/reply** ([#171](https://github.com/KMX415/meshpoint/issues/171)) and **traceroute** ([#170](https://github.com/KMX415/meshpoint/issues/170)) have no API yet. The bridge reports traceroute as unsupported; NodeInfo requests currently fall back to `POST /api/config/nodeinfo/send` (to be changed, see above).
+4. **NodeInfo request/reply** ([#171](https://github.com/KMX415/meshpoint/issues/171)) and **traceroute** ([#170](https://github.com/KMX415/meshpoint/issues/170)) have no API yet. The bridge reports traceroute as unsupported; NodeInfo requests are reported to the app as unsupported (`BAD_REQUEST`), and the bridge still calls `POST /api/config/nodeinfo/send` as a broadcast fallback.
 5. **No configuration writes.** Settings changes the app sends (`set_config`, favorites, contacts) are not applied, because there is no API for them and the dashboard is the place to change Meshpoint settings. The bridge refuses them with the routing error `NOT_AUTHORIZED`, so the app does not keep a change that was never made.

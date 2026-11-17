@@ -69,6 +69,7 @@ The bridge presents a virtual Meshtastic node to the phone. Meshpoint remains re
 - Text-message RX through Meshpoint's WebSocket.
 - Direct-message acknowledgement tracking when Meshpoint returns a correlatable packet ID and a recipient acknowledgement is observed.
 - NodeInfo and position forwarding, including Meshpoint-reported hop count and SNR.
+- "Exchange user info" from the app is reported as unsupported (`BAD_REQUEST`), because Meshpoint cannot send a direct NodeInfo request yet. As a fallback, Meshpoint broadcasts its own NodeInfo to the mesh (at most once every 5 minutes); see [Exchange user info](#exchange-user-info).
 - Device-metric forwarding for battery percentage, voltage, channel utilization, and transmit airtime utilization when Meshpoint supplies those values. Hop count and battery percentage have been observed in the native app; the other metrics still need individual live verification.
 - Environmental temperature and relative-humidity forwarding through Meshtastic `TELEMETRY_APP`; both have been verified in the native app and matched Meshpoint readings.
 - Read-only responses to selected admin queries. Settings changes from the app (owner name, config, channels, favorites, contacts, time) are not applied and are refused with `NOT_AUTHORIZED`; see [Settings changes from the app](#settings-changes-from-the-app).
@@ -84,8 +85,8 @@ Items marked *not yet live-verified* were added in a hardening update. They are 
 The following are **not implemented yet**:
 
 - Five-day node-list retention with older nodes retained only when locally favorited.
-- Persisting favorite/unfavorite actions from the native Meshtastic app to a bridge-local favorites file. The current bridge refuses `set_favorite_node`, so favorites set in the app are not kept.
-- Increase support for more Meshtastic packet types and administration operations (traceroute, node info exchanges).
+- Persisting favorite/unfavorite actions from the native Meshtastic app to a bridge-local favorites file. The current bridge refuses `set_favorite_node`, so favorites set in the app are lost when the app reconnects.
+- Increase support for more Meshtastic packet types and administration operations (traceroute, direct node info exchanges). Both need Meshpoint support first.
 - Replies and tapbacks in either direction. A `--probe` capture on November 11, 2026 showed that Meshpoint's WebSocket events do not include the Meshtastic `reply_id` or `emoji` (tapback) fields, so a tapback arrives as a plain text packet containing the emoji. Meshpoint's `POST /api/messages/send` request also has no fields for them, so replies and tapbacks sent from the phone go out as plain text. This needs a change in Meshpoint; an issue is being raised on the Meshpoint repository.
 
 The planned favorite list will be managed by the bridge and will be independent of Meshpoint dashboard favorites. The intended retention rule is: include nodes heard in the previous five days **or** nodes favorited locally through the Meshtastic app.
@@ -182,11 +183,15 @@ In the iPhone Meshtastic app (2.7.28) this shows as **Transmit** turned off in t
 
 This deliberately differs from a stock Meshtastic node with transmit disabled: the firmware drops the packet without telling the app, which waits and eventually shows "Failed to deliver to mesh". The bridge fails the send right away (routing error `NO_INTERFACE`) so it is clear the message was not sent.
 
+## Exchange user info
+
+Meshpoint cannot yet send a direct NodeInfo request to one node and wait for its reply. When you use "Exchange user info" in the app, the bridge tells the app the request failed (routing error `BAD_REQUEST`), so the app does not show a direct exchange that never happened. As a fallback it still asks Meshpoint to broadcast its own NodeInfo to the mesh, at most once every 5 minutes, so other nodes learn the Meshpoint's name and public key. If the other node sends its NodeInfo in return, or it is heard later, it appears in the app straight away. In receive-only mode nothing is broadcast.
+
 ## Settings changes from the app
 
 The bridge does not apply settings changes sent from the Meshtastic app: owner name, radio and module config, channels, favorites, contacts and time. Meshpoint has no API for them, and its settings belong in the Meshpoint dashboard. The bridge refuses each change with the routing error `NOT_AUTHORIZED`, the same error firmware uses when it refuses an admin change.
 
-The app (tested with iPhone app 2.7.28) shows no error message for this, but it does not keep the change: after renaming the node or favoriting another node, the old name or favorite state is shown again when you revisit it. Connecting and sending messages work normally, including DMs (the app favorites the recipient before each DM; that favorite is refused but the message is still sent).
+The app (tested with iPhone app 2.7.28) shows no error message for this. A renamed node keeps its real name: after saving, the app still shows Meshpoint's name. Favorites are different, because the app updates its own copy first: a node favorited from the node list stays starred until the app is closed or reconnects, and the automatic favorite before a DM is gone as soon as the node list reloads. Connecting and sending messages work normally, including DMs (that automatic favorite is refused but the message is still sent).
 
 ## Settings
 
