@@ -62,7 +62,7 @@ The bridge presents a virtual Meshtastic node to the phone. Meshpoint remains re
 - mDNS service advertisement (`_meshtastic._tcp.local.`) when `zeroconf` is installed.
 - Runs as a systemd service under its own `meshpoint-bridge` user, installed and removed with `install.sh`, with settings and the dashboard password in a protected settings file created by `--setup` *(not yet live-verified)*.
 - Meshpoint dashboard authentication from the settings file (or an interactive prompt when run by hand). The credentials are kept in memory so the bridge can log in again if the dashboard session expires *(not yet live-verified)*.
-- Optional listen-address, client allowlist and mDNS settings (see [Security](#security)) *(not yet live-verified)*.
+- Optional listen-address, client allowlist and mDNS settings (see [Security](#security)).
 - Receive-only mode when Meshpoint has no transmit identity, or when forced (see [Receive-only mode](#receive-only-mode)) *(not yet live-verified)*.
 - Initial configuration and node database exchange with the Meshtastic app.
 - Text-message TX through Meshpoint's REST API.
